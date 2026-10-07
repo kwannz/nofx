@@ -1,5 +1,10 @@
 import { Shield, AlertTriangle } from 'lucide-react'
 import type { RiskControlConfig } from '../../types'
+import {
+  effectiveCommodityMaxLeverage,
+  effectiveEquityMaxLeverage,
+  followsAltcoinCap,
+} from './leverageCaps'
 
 interface RiskControlEditorProps {
   config: RiskControlConfig
@@ -29,6 +34,7 @@ export function RiskControlEditor({
       equityLeverageDesc: { zh: 'Bitget 美股永续等 TradFi 标的开仓杠杆上限（5×24 交易时段）', en: 'Leverage cap for equity/ETF perps such as Bitget NVDAUSDT (5x24 session)' },
       commodityLeverage: { zh: '商品/外汇 交易杠杆', en: 'Commodity/FX Trading Leverage' },
       commodityLeverageDesc: { zh: '黄金、原油、外汇等 TradFi 标的开仓杠杆上限', en: 'Leverage cap for commodity/FX perps such as XAUUSDT' },
+      followsAltcoin: { zh: '未单独设置：跟随山寨币杠杆上限', en: 'Not set separately: follows the altcoin cap' },
       // Position value ratio (risk control) - CODE ENFORCED
       positionValueRatio: { zh: '仓位价值比例（代码强制）', en: 'Position Value Ratio (CODE ENFORCED)' },
       positionValueRatioDesc: { zh: '单仓位名义价值 / 账户净值，由代码强制执行', en: 'Position notional value / equity, enforced by code' },
@@ -49,6 +55,12 @@ export function RiskControlEditor({
     }
     return translations[key]?.[language] || key
   }
+
+  // Effective TradFi caps: configs without these fields are enforced with the altcoin cap by the backend.
+  const equityLeverage = effectiveEquityMaxLeverage(config)
+  const commodityLeverage = effectiveCommodityMaxLeverage(config)
+  const equityFollowsAltcoin = followsAltcoinCap(config.equity_max_leverage)
+  const commodityFollowsAltcoin = followsAltcoinCap(config.commodity_max_leverage)
 
   const updateField = <K extends keyof RiskControlConfig>(
     key: K,
@@ -178,11 +190,20 @@ export function RiskControlEditor({
             </label>
             <p className="text-xs mb-2" style={{ color: '#848E9C' }}>
               {t('equityLeverageDesc')}
+              {equityFollowsAltcoin && (
+                <span
+                  data-testid="equity-follows-altcoin"
+                  style={{ color: '#F0B90B' }}
+                >
+                  {' '}
+                  ({t('followsAltcoin')}: {equityLeverage}x)
+                </span>
+              )}
             </p>
             <div className="flex items-center gap-2">
               <input
                 type="range"
-                value={config.equity_max_leverage ?? 5}
+                value={equityLeverage}
                 onChange={(e) =>
                   updateField('equity_max_leverage', parseInt(e.target.value))
                 }
@@ -195,7 +216,7 @@ export function RiskControlEditor({
                 className="w-12 text-center font-mono"
                 style={{ color: '#F0B90B' }}
               >
-                {config.equity_max_leverage ?? 5}x
+                {equityLeverage}x
               </span>
             </div>
           </div>
@@ -209,11 +230,20 @@ export function RiskControlEditor({
             </label>
             <p className="text-xs mb-2" style={{ color: '#848E9C' }}>
               {t('commodityLeverageDesc')}
+              {commodityFollowsAltcoin && (
+                <span
+                  data-testid="commodity-follows-altcoin"
+                  style={{ color: '#F0B90B' }}
+                >
+                  {' '}
+                  ({t('followsAltcoin')}: {commodityLeverage}x)
+                </span>
+              )}
             </p>
             <div className="flex items-center gap-2">
               <input
                 type="range"
-                value={config.commodity_max_leverage ?? 10}
+                value={commodityLeverage}
                 onChange={(e) =>
                   updateField('commodity_max_leverage', parseInt(e.target.value))
                 }
@@ -226,7 +256,7 @@ export function RiskControlEditor({
                 className="w-12 text-center font-mono"
                 style={{ color: '#F0B90B' }}
               >
-                {config.commodity_max_leverage ?? 10}x
+                {commodityLeverage}x
               </span>
             </div>
           </div>

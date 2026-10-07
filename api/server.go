@@ -14,7 +14,6 @@ import (
 	"nofx/manager"
 	"nofx/market"
 	"nofx/provider/alpaca"
-	"nofx/provider/bitget"
 	"nofx/provider/coinank/coinank_api"
 	"nofx/provider/coinank/coinank_enum"
 	"nofx/provider/hyperliquid"
@@ -2265,7 +2264,7 @@ func (s *Server) handleTrades(c *gin.Context) {
 
 	// Normalize symbol (add USDT suffix if not present; Bitget keeps TradFi names like NVDAUSDT)
 	if symbol != "" {
-		symbol = normalizeSymbolForExchange(symbol, trader.GetExchange())
+		symbol = market.NormalizeForSource(symbol, market.SourceForExchange(trader.GetExchange()))
 	}
 
 	// Get trades from store
@@ -2321,7 +2320,7 @@ func (s *Server) handleOrders(c *gin.Context) {
 
 	// Normalize symbol (add USDT suffix if not present; Bitget keeps TradFi names like NVDAUSDT)
 	if symbol != "" {
-		symbol = normalizeSymbolForExchange(symbol, trader.GetExchange())
+		symbol = market.NormalizeForSource(symbol, market.SourceForExchange(trader.GetExchange()))
 	}
 
 	// Get orders from store
@@ -2400,7 +2399,7 @@ func (s *Server) handleOpenOrders(c *gin.Context) {
 	}
 
 	// Normalize symbol (Bitget keeps TradFi names like NVDAUSDT)
-	symbol = normalizeSymbolForExchange(symbol, trader.GetExchange())
+	symbol = market.NormalizeForSource(symbol, market.SourceForExchange(trader.GetExchange()))
 
 	// Get open orders from exchange
 	openOrders, err := trader.GetOpenOrders(symbol)
@@ -2464,8 +2463,8 @@ func (s *Server) handleKlines(c *gin.Context) {
 		// Bitget public candles: same venue the (paper) trader executes on, and the only
 		// source that has TradFi perps such as NVDAUSDT / XAUUSDT. Intervals Bitget does not
 		// offer fall back to CoinAnk.
-		symbol = normalizeSymbolForExchange(symbol, exchangeLower)
-		klines, err = getKlinesFromBitget(symbol, interval, limit)
+		symbol = market.NormalizeForSource(symbol, market.SourceForExchange(exchangeLower))
+		klines, err = market.BitgetKlines(symbol, interval, limit)
 		if err != nil {
 			logger.Warnf("⚠️ Bitget klines failed (%v), falling back to CoinAnk", err)
 			klines, err = s.getKlinesFromCoinank(symbol, interval, "bitget", limit)
@@ -2485,42 +2484,6 @@ func (s *Server) handleKlines(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, klines)
-}
-
-// normalizeSymbolForExchange normalizes a user-supplied symbol for an exchange type. Bitget
-// (live and paper) keeps XXXUSDT contract names; everything else uses the default mapping.
-func normalizeSymbolForExchange(symbol, exchange string) string {
-	switch strings.ToLower(exchange) {
-	case "bitget", "bitget_paper":
-		return market.NormalizeForSource(symbol, market.SourceBitget)
-	}
-	return market.Normalize(symbol)
-}
-
-// getKlinesFromBitget fetches klines from Bitget's public USDT-futures candles endpoint.
-func getKlinesFromBitget(symbol, interval string, limit int) ([]market.Kline, error) {
-	candles, err := bitget.GetCandles(symbol, interval, limit)
-	if err != nil {
-		return nil, err
-	}
-	dur, durErr := market.TFDuration(interval)
-	klines := make([]market.Kline, len(candles))
-	for i, c := range candles {
-		k := market.Kline{
-			OpenTime:    c.OpenTime,
-			Open:        c.Open,
-			High:        c.High,
-			Low:         c.Low,
-			Close:       c.Close,
-			Volume:      c.Volume,
-			QuoteVolume: c.QuoteVolume,
-		}
-		if durErr == nil {
-			k.CloseTime = c.OpenTime + dur.Milliseconds() - 1
-		}
-		klines[i] = k
-	}
-	return klines, nil
 }
 
 // getKlinesFromCoinank fetches kline data from coinank free/open API for multiple exchanges

@@ -34,7 +34,22 @@ func GetWithTimeframesFromSource(symbol string, timeframes []string, primaryTime
 	return getFromBitget(symbol, timeframes, primaryTimeframe, count, false)
 }
 
-func bitgetKlines(symbol, tf string, limit int) ([]Kline, error) {
+// SourceForExchange maps an exchange type to its market data source. Bitget (live/demo and the
+// local paper exchange) uses Bitget public data so TradFi symbols such as NVDAUSDT / XAUUSDT
+// resolve to the same venue that executes the orders; every other exchange keeps the legacy
+// routing. It is the single place that knows which exchange types are Bitget.
+func SourceForExchange(exchangeType string) Source {
+	switch strings.ToLower(strings.TrimSpace(exchangeType)) {
+	case "bitget", "bitget_paper":
+		return SourceBitget
+	}
+	return SourceDefault
+}
+
+// BitgetKlines fetches klines from Bitget's public USDT-futures candles endpoint (ascending by
+// time, CloseTime filled from the timeframe when it is a known one). The symbol is used as given:
+// normalize it with NormalizeForSource(symbol, SourceBitget) first.
+func BitgetKlines(symbol, tf string, limit int) ([]Kline, error) {
 	candles, err := bitget.GetCandles(symbol, tf, limit)
 	if err != nil {
 		return nil, err
@@ -73,7 +88,7 @@ func getFromBitget(symbol string, timeframes []string, primaryTimeframe string, 
 
 	var data *Data
 	if legacy {
-		k3m, err := bitgetKlines(symbol, "3m", 100)
+		k3m, err := BitgetKlines(symbol, "3m", 100)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get 3-minute K-line from Bitget: %w", err)
 		}
@@ -83,7 +98,7 @@ func getFromBitget(symbol string, timeframes []string, primaryTimeframe string, 
 		if isStaleData(k3m, symbol) {
 			return nil, fmt.Errorf("%s data is stale, possible cache failure", symbol)
 		}
-		k4h, err := bitgetKlines(symbol, "4h", 100)
+		k4h, err := BitgetKlines(symbol, "4h", 100)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get 4-hour K-line from Bitget: %w", err)
 		}
@@ -109,7 +124,17 @@ func getFromBitget(symbol string, timeframes []string, primaryTimeframe string, 
 		tfData := make(map[string]*TimeframeSeriesData)
 		var primary []Kline
 		for _, tf := range timeframes {
-			klines, err := bitgetKlines(symbol, tf, 200)
+			// Fail fast on a timeframe Bitget has no candles for instead of sending a request that
+			// is bound to fail: a missing secondary timeframe only costs that series, but the
+			// primary timeframe drives every indicator and cannot be skipped.
+			if _, gerr := bitget.Granularity(tf); gerr != nil {
+				if tf == primaryTimeframe {
+					return nil, fmt.Errorf("primary timeframe %q is not supported by Bitget: %w", tf, gerr)
+				}
+				logger.Warnf("⚠️ Skipping %s timeframe %q: not supported by Bitget (%v)", symbol, tf, gerr)
+				continue
+			}
+			klines, err := BitgetKlines(symbol, tf, 200)
 			if err != nil {
 				logger.Infof("⚠️ Failed to get %s %s K-line from Bitget: %v", symbol, tf, err)
 				continue

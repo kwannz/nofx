@@ -26,18 +26,34 @@ type BitgetTrade struct {
 	ProfitLoss  float64
 	OrderType   string
 	OrderAction string // open_long, open_short, close_long, close_short
+	TradeSide   string // raw tradeSide (open/close/buy_single/sell_single/...)
+	// ActionAmbiguous marks fills whose OrderAction was guessed from realized profit == 0
+	// (one-way fills): a break-even close looks exactly like an open. SyncOrdersFromBitget
+	// re-classifies those against the open positions in the store, in time order.
+	ActionAmbiguous bool
 }
 
 // bitgetFillMaxPages bounds fill-history pagination per sync run
 const bitgetFillMaxPages = 10
 
 // classifyBitgetFill determines the order action (open_long/open_short/close_long/close_short)
-// from a fill's side, tradeSide and realized profit.
+// from a fill's side, tradeSide and realized profit alone (position-blind).
 //
 // Hedge mode reports tradeSide=open|close (and reduce_close_long, burst_close_short, ...);
 // one-way mode reports buy_single|sell_single, where a non-zero realized profit means the
 // fill reduced a position. Prefixes reduce_/burst_/offset_/delivery_/dte_ and "close" are closes.
+//
+// A one-way fill with zero profit is ambiguous (open, or a break-even close); this function
+// reports it as an open. Use classifyBitgetFillWithPositions to resolve it.
 func classifyBitgetFill(side, tradeSide string, profit float64) string {
+	action, _ := classifyBitgetFillDetailed(side, tradeSide, profit)
+	return action
+}
+
+// classifyBitgetFillDetailed is classifyBitgetFill plus an "ambiguous" flag: true when the
+// action was inferred from profit == 0 only (one-way buy_single/sell_single or unknown
+// tradeSide), i.e. when a break-even close cannot be told apart from an open.
+func classifyBitgetFillDetailed(side, tradeSide string, profit float64) (action string, ambiguous bool) {
 	side = strings.ToLower(side)
 	ts := strings.ToLower(tradeSide)
 
@@ -57,26 +73,52 @@ func classifyBitgetFill(side, tradeSide string, profit float64) string {
 
 	switch {
 	case ts == "open":
-		return openBySide()
+		return openBySide(), false
 	case ts == "close":
-		return closeBySide()
+		return closeBySide(), false
 	case strings.HasSuffix(ts, "_long") && isBitgetCloseTradeSide(ts):
-		return "close_long"
+		return "close_long", false
 	case strings.HasSuffix(ts, "_short") && isBitgetCloseTradeSide(ts):
-		return "close_short"
+		return "close_short", false
 	case isBitgetCloseTradeSide(ts):
-		return closeBySide()
-	case ts == "buy_single" || ts == "sell_single":
-		if profit != 0 {
-			return closeBySide()
-		}
-		return openBySide()
+		return closeBySide(), false
 	}
-	// Unknown tradeSide: fall back to realized profit
+	// One-way (buy_single/sell_single) or unknown tradeSide: realized profit decides.
 	if profit != 0 {
-		return closeBySide()
+		return closeBySide(), false
 	}
-	return openBySide()
+	return openBySide(), true
+}
+
+// bitgetOpenPositionFunc reports whether the trader has an OPEN position on the given
+// side ("LONG"/"SHORT") of symbol.
+type bitgetOpenPositionFunc func(symbol, positionSide string) (bool, error)
+
+// classifyBitgetFillWithPositions is the position-aware classifier. Explicit open/close/
+// reduce_/burst_/offset_ tradeSides and fills with realized profit behave exactly like
+// classifyBitgetFill. A one-way fill with zero realized profit is resolved against the open
+// positions: a sell while a LONG is open (or a buy while a SHORT is open) reduces that
+// position, so it is a break-even close; otherwise it is a genuine open. When the lookup is nil
+// or fails the fill is reported as an open (the position-blind answer).
+func classifyBitgetFillWithPositions(symbol, side, tradeSide string, profit float64, hasOpen bitgetOpenPositionFunc) string {
+	action, ambiguous := classifyBitgetFillDetailed(side, tradeSide, profit)
+	if !ambiguous || hasOpen == nil {
+		return action
+	}
+	oppositeSide, closeAction := "SHORT", "close_short" // a buy reduces a short
+	if strings.ToLower(side) == "sell" {
+		oppositeSide, closeAction = "LONG", "close_long" // a sell reduces a long
+	}
+	has, err := hasOpen(symbol, oppositeSide)
+	if err != nil {
+		logger.Warnf("⚠️  Bitget fill classification: cannot look up open %s %s position, treating zero-profit fill as open: %v",
+			oppositeSide, symbol, err)
+		return action
+	}
+	if has {
+		return closeAction
+	}
+	return action
 }
 
 func isBitgetCloseTradeSide(ts string) bool {
@@ -165,6 +207,7 @@ func (t *BitgetTrader) GetTrades(startTime time.Time, limit int) ([]BitgetTrade,
 				feeAsset = "USDT"
 			}
 
+			action, ambiguous := classifyBitgetFillDetailed(fill.Side, fill.TradeSide, profit)
 			trades = append(trades, BitgetTrade{
 				Symbol:      strings.ToUpper(fill.Symbol),
 				TradeID:     fill.TradeID,
@@ -177,7 +220,10 @@ func (t *BitgetTrader) GetTrades(startTime time.Time, limit int) ([]BitgetTrade,
 				ExecTime:    time.UnixMilli(cTime).UTC(),
 				ProfitLoss:  profit,
 				OrderType:   "MARKET",
-				OrderAction: classifyBitgetFill(fill.Side, fill.TradeSide, profit),
+				OrderAction: action,
+				TradeSide:   fill.TradeSide,
+
+				ActionAmbiguous: ambiguous,
 			})
 		}
 
@@ -224,6 +270,14 @@ func (t *BitgetTrader) SyncOrdersFromBitget(traderID string, exchangeID string, 
 	posBuilder := store.NewPositionBuilder(positionStore)
 	syncedCount := 0
 
+	// Break-even one-way closes are indistinguishable from opens by the fill alone; decide
+	// against the positions recorded so far. Trades are processed oldest first, so earlier
+	// fills of this batch are already reflected in the store.
+	openLookup := func(symbol, positionSide string) (bool, error) {
+		pos, err := positionStore.GetOpenPositionBySymbol(traderID, symbol, positionSide)
+		return pos != nil, err
+	}
+
 	for _, trade := range trades {
 		// Check if trade already exists (use exchangeID which is UUID, not exchange type)
 		existing, err := orderStore.GetOrderByExchangeID(exchangeID, trade.TradeID)
@@ -233,6 +287,15 @@ func (t *BitgetTrader) SyncOrdersFromBitget(traderID string, exchangeID string, 
 
 		// Keep the native Bitget symbol (market.Normalize would map e.g. NVDAUSDT to xyz:NVDA)
 		symbol := strings.ToUpper(trade.Symbol)
+
+		if trade.ActionAmbiguous {
+			resolved := classifyBitgetFillWithPositions(symbol, trade.Side, trade.TradeSide, trade.ProfitLoss, openLookup)
+			if resolved != trade.OrderAction {
+				logger.Infof("  🔎 Break-even fill %s %s reclassified %s -> %s (open opposite position found)",
+					symbol, trade.TradeID, trade.OrderAction, resolved)
+			}
+			trade.OrderAction = resolved
+		}
 
 		// Determine position side from order action
 		positionSide := "LONG"

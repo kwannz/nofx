@@ -28,10 +28,15 @@ import (
 // mutation rate is a few per minute at most and a snapshot is a few KB.
 
 const (
-	paperSnapshotVersion  = 1
-	paperPersistMaxFills  = 500 // recent fills kept for GetOrderStatus after a restart
-	paperPersistMaxClosed = 500 // recent closed-trade records kept for GetClosedPnL
-	paperRejectedSuffix   = ".rejected"
+	// paperSnapshotVersion 2 stores funding progress as unix timestamps (funding_boundary /
+	// last_funding_at). Version 1 stored a slot index in units of the contract's fundInterval
+	// at open time, which breaks when Bitget changes that interval; it is still readable and
+	// migrated on load (see migrate).
+	paperSnapshotVersion    = 2
+	paperSnapshotMinVersion = 1
+	paperPersistMaxFills    = 500 // recent fills kept for GetOrderStatus after a restart
+	paperPersistMaxClosed   = 500 // recent closed-trade records kept for GetClosedPnL
+	paperRejectedSuffix     = ".rejected"
 )
 
 var (
@@ -110,7 +115,8 @@ type paperSnapshot struct {
 	Cash            float64             `json:"cash"`
 	RealizedPnL     float64             `json:"realized_pnl"` // cumulative gross price PnL of closing fills
 	Seq             uint64              `json:"next_order_seq"`
-	LastFundingSlot int64               `json:"last_funding_slot"`
+	LastFundingAt   int64               `json:"last_funding_at"`
+	LastFundingSlot int64               `json:"last_funding_slot,omitempty"` // v1 only (index), read for migration
 	Positions       []paperPositionSnap `json:"positions"`
 	Leverage        map[string]int      `json:"leverage"`
 	CrossMode       map[string]bool     `json:"cross_mode"`
@@ -119,17 +125,20 @@ type paperSnapshot struct {
 }
 
 type paperPositionSnap struct {
-	ID          string       `json:"id"`
-	Symbol      string       `json:"symbol"`
-	Side        string       `json:"side"`
-	Qty         float64      `json:"qty"`
-	Entry       float64      `json:"entry_price"`
-	Leverage    int          `json:"leverage"`
-	Margin      float64      `json:"margin"`
-	OpenFee     float64      `json:"open_fee"`
-	Funding     float64      `json:"funding"`
-	OpenedAt    time.Time    `json:"opened_at"`
-	FundingSlot int64        `json:"funding_slot"`
+	ID       string    `json:"id"`
+	Symbol   string    `json:"symbol"`
+	Side     string    `json:"side"`
+	Qty      float64   `json:"qty"`
+	Entry    float64   `json:"entry_price"`
+	Leverage int       `json:"leverage"`
+	Margin   float64   `json:"margin"`
+	OpenFee  float64   `json:"open_fee"`
+	Funding  float64   `json:"funding"`
+	OpenedAt time.Time `json:"opened_at"`
+	// FundingBoundary is the unix time (seconds) funding has been settled through (v2).
+	FundingBoundary int64 `json:"funding_boundary"`
+	// FundingSlot is the v1 slot index; it is only read when migrating a v1 snapshot.
+	FundingSlot int64        `json:"funding_slot,omitempty"`
 	SL          *paperTrigSn `json:"stop_loss,omitempty"`
 	TP          *paperTrigSn `json:"take_profit,omitempty"`
 }
@@ -188,23 +197,23 @@ func snapToTrig(s *paperTrigSn) *paperTrigger {
 // snapshotLocked captures the account state. t.mu must be held.
 func (t *BitgetPaperTrader) snapshotLocked() *paperSnapshot {
 	s := &paperSnapshot{
-		Version:         paperSnapshotVersion,
-		TraderID:        t.traderID,
-		SavedAt:         t.now().UTC(),
-		Initial:         t.initial,
-		Cash:            t.cash,
-		RealizedPnL:     t.realized,
-		Seq:             t.seq,
-		LastFundingSlot: t.lastFundingSlot,
-		Positions:       make([]paperPositionSnap, 0, len(t.positions)),
-		Leverage:        make(map[string]int, len(t.leverage)),
-		CrossMode:       make(map[string]bool, len(t.crossMode)),
+		Version:       paperSnapshotVersion,
+		TraderID:      t.traderID,
+		SavedAt:       t.now().UTC(),
+		Initial:       t.initial,
+		Cash:          t.cash,
+		RealizedPnL:   t.realized,
+		Seq:           t.seq,
+		LastFundingAt: t.lastFundingAt,
+		Positions:     make([]paperPositionSnap, 0, len(t.positions)),
+		Leverage:      make(map[string]int, len(t.leverage)),
+		CrossMode:     make(map[string]bool, len(t.crossMode)),
 	}
 	for _, p := range t.sortedPositionsLocked() {
 		s.Positions = append(s.Positions, paperPositionSnap{
 			ID: p.id, Symbol: p.symbol, Side: p.side, Qty: p.qty, Entry: p.entry,
 			Leverage: p.leverage, Margin: p.margin, OpenFee: p.openFee, Funding: p.funding,
-			OpenedAt: p.openedAt, FundingSlot: p.fundingSlot,
+			OpenedAt: p.openedAt, FundingBoundary: p.fundedThrough,
 			SL: trigToSnap(p.sl), TP: trigToSnap(p.tp),
 		})
 	}
@@ -253,8 +262,8 @@ func finite(vs ...float64) bool {
 
 // validate rejects snapshots that would put the account into an impossible state.
 func (s *paperSnapshot) validate(traderID string) error {
-	if s.Version != paperSnapshotVersion {
-		return fmt.Errorf("unsupported snapshot version %d (this build reads version %d)", s.Version, paperSnapshotVersion)
+	if s.Version < paperSnapshotMinVersion || s.Version > paperSnapshotVersion {
+		return fmt.Errorf("unsupported snapshot version %d (this build reads versions %d-%d)", s.Version, paperSnapshotMinVersion, paperSnapshotVersion)
 	}
 	if s.TraderID != "" && s.TraderID != traderID {
 		return fmt.Errorf("snapshot belongs to trader %q", s.TraderID)
@@ -271,7 +280,10 @@ func (s *paperSnapshot) validate(traderID string) error {
 		if p.Side != "long" && p.Side != "short" {
 			return fmt.Errorf("position %s: invalid side %q", p.Symbol, p.Side)
 		}
-		if !validPrice(p.Qty) || !validPrice(p.Entry) || !finite(p.Margin, p.OpenFee, p.Funding) || p.Margin < 0 || p.Leverage < 1 {
+		// Margin may legitimately be negative: funding is charged against the position margin and
+		// can exceed it while unrealized PnL still keeps the position above liquidation. Only
+		// NaN/Inf are rejected (finite check below).
+		if !validPrice(p.Qty) || !validPrice(p.Entry) || !finite(p.Margin, p.OpenFee, p.Funding) || p.Leverage < 1 {
 			return fmt.Errorf("position %s: invalid numbers (qty %v entry %v margin %v lev %d)", p.Symbol, p.Qty, p.Entry, p.Margin, p.Leverage)
 		}
 		for _, tr := range []*paperTrigSn{p.SL, p.TP} {
@@ -283,19 +295,54 @@ func (s *paperSnapshot) validate(traderID string) error {
 	return nil
 }
 
+// migrate upgrades an older snapshot in place to the current version.
+//
+// v1 -> v2: v1 kept per position a funding slot index in units of the contract's fundInterval AT
+// OPEN TIME. That interval is not recorded, so the index cannot be turned into a time reliably
+// (guessing 8h would put a 4h contract's marker far in the future). Instead the per-position
+// marker is reset to the time the snapshot was written: funding is considered settled up to
+// that moment (the matcher settles every few seconds and persists each settlement, so this is
+// exact in the normal case) and the boundaries that passed since are settled on the first tick
+// with the contract's CURRENT interval. At worst a boundary that was still pending (rate
+// unavailable) when the v1 snapshot was written is not paid. The marker is clamped to
+// [position open time, now].
+func (s *paperSnapshot) migrate(now time.Time) {
+	if s.Version >= 2 {
+		return
+	}
+	saved := s.SavedAt.UTC().Unix()
+	if s.SavedAt.IsZero() || saved > now.UTC().Unix() {
+		saved = now.UTC().Unix()
+	}
+	var latest int64
+	for i := range s.Positions {
+		p := &s.Positions[i]
+		through := saved
+		if opened := p.OpenedAt.UTC().Unix(); !p.OpenedAt.IsZero() && through < opened {
+			through = opened
+		}
+		p.FundingBoundary, p.FundingSlot = through, 0
+		if through > latest {
+			latest = through
+		}
+	}
+	s.LastFundingAt, s.LastFundingSlot = latest, 0
+	s.Version = paperSnapshotVersion
+}
+
 // applySnapshotLocked replaces the account state with s. t.mu must be held; s must be valid.
 func (t *BitgetPaperTrader) applySnapshotLocked(s *paperSnapshot) {
 	t.initial = s.Initial
 	t.cash = s.Cash
 	t.realized = s.RealizedPnL
 	t.seq = s.Seq
-	t.lastFundingSlot = s.LastFundingSlot
+	t.lastFundingAt = s.LastFundingAt
 	t.positions = make(map[string]*paperPosition, len(s.Positions))
 	for _, p := range s.Positions {
 		t.positions[p.Symbol] = &paperPosition{
 			id: p.ID, symbol: p.Symbol, side: p.Side, qty: p.Qty, entry: p.Entry,
 			leverage: p.Leverage, margin: p.Margin, openFee: p.OpenFee, funding: p.Funding,
-			openedAt: p.OpenedAt, fundingSlot: p.FundingSlot,
+			openedAt: p.OpenedAt, fundedThrough: p.FundingBoundary,
 			sl: snapToTrig(p.SL), tp: snapToTrig(p.TP),
 		}
 	}
@@ -430,6 +477,11 @@ func (t *BitgetPaperTrader) attachState(traderID string) {
 	err = json.Unmarshal(data, &snap)
 	if err == nil {
 		err = snap.validate(traderID)
+	}
+	if err == nil && snap.Version < paperSnapshotVersion {
+		from := snap.Version
+		snap.migrate(t.now())
+		logger.Infof("♻️ [BitgetPaper] migrated account snapshot of trader %s from v%d to v%d (funding markers reset to the save time)", traderID, from, snap.Version)
 	}
 	if err != nil {
 		// Keep the unreadable file for inspection instead of overwriting it with the next write.

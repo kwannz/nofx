@@ -151,18 +151,25 @@ func (e *StrategyEngine) isNonCrypto(symbol string) bool {
 	return bitget.AssetClass(*c) != bitget.ClassCrypto
 }
 
-// dropUntradableOpens removes open_long/open_short decisions for instruments whose
-// market is closed or halted (Bitget TradFi perps outside their 5x24 session).
-// Dropping them individually keeps the rest of the cycle's decisions (e.g. closes on
-// other symbols) executable instead of failing the whole batch in validateDecisions.
+// dropUntradableOpens removes open_long/open_short decisions for instruments that cannot be
+// opened right now: market closed or halted (Bitget TradFi perps outside their 5x24 session)
+// or contract metadata that cannot be resolved (unknown/delisted symbol, network error).
+// validateDecisionEnv rejects both cases, and one rejected decision fails the whole batch, so
+// dropping them individually keeps the rest of the cycle's decisions (e.g. closes on other
+// symbols) executable.
 func dropUntradableOpens(decisions []Decision, env *validationEnv) []Decision {
 	if env == nil || !env.Bitget {
 		return decisions
 	}
-	kept := decisions[:0]
+	kept := make([]Decision, 0, len(decisions)) // fresh slice: never rewrite the caller's backing array
 	for _, d := range decisions {
 		if d.Action == "open_long" || d.Action == "open_short" {
-			if info, err := resolveSymbol(d.Symbol, nowFunc()); err == nil && !info.Open {
+			info, err := resolveSymbol(d.Symbol, nowFunc())
+			if err != nil {
+				logger.Warnf("⚠️  Dropping %s %s: contract metadata unavailable (%v)", d.Action, d.Symbol, err)
+				continue
+			}
+			if !info.Open {
 				logger.Infof("⏸️  Dropping %s %s: market closed (%s, %s)", d.Action, d.Symbol, info.AssetClass, info.Note)
 				continue
 			}

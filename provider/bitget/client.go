@@ -7,6 +7,7 @@ package bitget
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,6 +27,12 @@ const (
 	ProductType = "USDT-FUTURES"
 
 	contractCacheTTL = 10 * time.Minute
+	// contractMissTTL is how long "symbol not found" is remembered, so an unknown or delisted
+	// symbol proposed every cycle does not cost an HTTP request each time.
+	contractMissTTL = 60 * time.Second
+	// contractErrTTL is how long a failed bulk load is remembered (fail fast for the other
+	// symbols of the same cycle) while keeping outages short: the next attempt after it retries.
+	contractErrTTL = 5 * time.Second
 )
 
 var (
@@ -38,7 +45,31 @@ var (
 	contractCache = map[string]cachedContract{}
 	// allFetchedAt is when the full contract list was last loaded.
 	allFetchedAt time.Time
+	// missCache holds symbols known to be absent (symbol -> expiry of the negative entry).
+	missCache = map[string]time.Time{}
+	// bulkErr / bulkErrAt remember the last failed full-list load for contractErrTTL.
+	bulkErr   error
+	bulkErrAt time.Time
+	// refreshMu serialises full-list loads so concurrent lookups share a single request.
+	refreshMu sync.Mutex
+
+	// nowFn is the clock (a seam for tests).
+	nowFn = time.Now
 )
+
+// ContractNotFoundError is returned by GetContract when the symbol is not a Bitget USDT-futures
+// contract (never listed, or delisted). Use IsContractNotFound to tell it from network errors.
+type ContractNotFoundError struct{ Symbol string }
+
+func (e *ContractNotFoundError) Error() string {
+	return fmt.Sprintf("bitget: contract %s not found", e.Symbol)
+}
+
+// IsContractNotFound reports whether err says the symbol does not exist (as opposed to a lookup failure).
+func IsContractNotFound(err error) bool {
+	var nf *ContractNotFoundError
+	return errors.As(err, &nf)
+}
 
 type cachedContract struct {
 	c         Contract
@@ -62,6 +93,8 @@ func ResetCache() {
 	contractMu.Lock()
 	contractCache = map[string]cachedContract{}
 	allFetchedAt = time.Time{}
+	missCache = map[string]time.Time{}
+	bulkErr, bulkErrAt = nil, time.Time{}
 	contractMu.Unlock()
 }
 
@@ -220,50 +253,114 @@ func fetchContracts(symbol string) ([]Contract, error) {
 	return out, nil
 }
 
-// GetContracts returns all USDT-futures contracts keyed by symbol. The result is
-// cached for ~10 minutes.
-func GetContracts() (map[string]Contract, error) {
+// contractsFreshLocked reports whether the full contract list is still within its TTL. contractMu must be held.
+func contractsFreshLocked(now time.Time) bool {
+	return !allFetchedAt.IsZero() && now.Sub(allFetchedAt) < contractCacheTTL
+}
+
+// refreshAllContracts loads the full contract list with ONE request and replaces the per-symbol
+// cache with it. It is a no-op when the list is fresh (another goroutine may have just loaded
+// it) and fails fast for contractErrTTL after a failed load. Network errors are never cached
+// beyond that, so an outage recovers on the next attempt.
+func refreshAllContracts() error {
+	refreshMu.Lock()
+	defer refreshMu.Unlock()
+
 	contractMu.Lock()
-	if !allFetchedAt.IsZero() && time.Since(allFetchedAt) < contractCacheTTL {
-		out := make(map[string]Contract, len(contractCache))
-		for k, v := range contractCache {
-			out[k] = v.c
-		}
+	now := nowFn()
+	if contractsFreshLocked(now) {
 		contractMu.Unlock()
-		return out, nil
+		return nil
+	}
+	if bulkErr != nil && now.Sub(bulkErrAt) < contractErrTTL {
+		err := bulkErr
+		contractMu.Unlock()
+		return err
 	}
 	contractMu.Unlock()
 
 	list, err := fetchContracts("")
+
+	contractMu.Lock()
+	defer contractMu.Unlock()
 	if err != nil {
+		bulkErr, bulkErrAt = err, nowFn()
+		return err
+	}
+	fetched := nowFn()
+	contractCache = make(map[string]cachedContract, len(list))
+	for _, c := range list {
+		contractCache[c.Symbol] = cachedContract{c: c, fetchedAt: fetched}
+	}
+	// the new list is authoritative: forget old "not found" verdicts
+	missCache = map[string]time.Time{}
+	allFetchedAt = fetched
+	bulkErr, bulkErrAt = nil, time.Time{}
+	return nil
+}
+
+// GetContracts returns all USDT-futures contracts keyed by symbol. The result is
+// cached for ~10 minutes.
+func GetContracts() (map[string]Contract, error) {
+	if err := refreshAllContracts(); err != nil {
 		return nil, err
 	}
-	now := time.Now()
-	out := make(map[string]Contract, len(list))
 	contractMu.Lock()
-	for _, c := range list {
-		contractCache[c.Symbol] = cachedContract{c: c, fetchedAt: now}
-		out[c.Symbol] = c
+	defer contractMu.Unlock()
+	out := make(map[string]Contract, len(contractCache))
+	for k, v := range contractCache {
+		out[k] = v.c
 	}
-	allFetchedAt = now
-	contractMu.Unlock()
 	return out, nil
 }
 
-// GetContract returns metadata for one symbol (cached ~10 min per symbol).
+// GetContract returns metadata for one symbol.
+//
+// Lookups are served from a per-symbol cache (~10 min). When the cache is cold or stale it is
+// repopulated from a single full-list request instead of one request per symbol. A symbol that
+// is not found is remembered for a minute (negative cache) so repeated lookups of an unknown or
+// delisted symbol stay local; network errors are not cached (see refreshAllContracts).
 func GetContract(symbol string) (*Contract, error) {
 	symbol = normSymbol(symbol)
 	if symbol == "" {
 		return nil, fmt.Errorf("bitget: empty symbol")
 	}
+
 	contractMu.Lock()
-	if e, ok := contractCache[symbol]; ok && time.Since(e.fetchedAt) < contractCacheTTL {
+	now := nowFn()
+	if e, ok := contractCache[symbol]; ok && now.Sub(e.fetchedAt) < contractCacheTTL {
 		c := e.c
 		contractMu.Unlock()
 		return &c, nil
 	}
+	if until, ok := missCache[symbol]; ok {
+		if now.Before(until) {
+			contractMu.Unlock()
+			return nil, &ContractNotFoundError{Symbol: symbol}
+		}
+		delete(missCache, symbol)
+	}
+	fresh := contractsFreshLocked(now)
 	contractMu.Unlock()
 
+	if !fresh {
+		// Cold or stale: one request fills the cache for every symbol.
+		if err := refreshAllContracts(); err != nil {
+			return nil, err
+		}
+		contractMu.Lock()
+		e, ok := contractCache[symbol]
+		contractMu.Unlock()
+		if ok {
+			c := e.c
+			return &c, nil
+		}
+		// absent from the list we just loaded: definitive
+		return nil, rememberMissing(symbol)
+	}
+
+	// The list is fresh but does not hold the symbol (e.g. listed after the last full load):
+	// confirm with a single-symbol request, at most once per negative-cache window.
 	list, err := fetchContracts(symbol)
 	if err != nil {
 		return nil, err
@@ -271,13 +368,22 @@ func GetContract(symbol string) (*Contract, error) {
 	for _, c := range list {
 		if c.Symbol == symbol {
 			contractMu.Lock()
-			contractCache[symbol] = cachedContract{c: c, fetchedAt: time.Now()}
+			contractCache[symbol] = cachedContract{c: c, fetchedAt: nowFn()}
+			delete(missCache, symbol)
 			contractMu.Unlock()
 			cc := c
 			return &cc, nil
 		}
 	}
-	return nil, fmt.Errorf("bitget: contract %s not found", symbol)
+	return nil, rememberMissing(symbol)
+}
+
+// rememberMissing records a negative cache entry and returns the not-found error.
+func rememberMissing(symbol string) error {
+	contractMu.Lock()
+	missCache[symbol] = nowFn().Add(contractMissTTL)
+	contractMu.Unlock()
+	return &ContractNotFoundError{Symbol: symbol}
 }
 
 // ----------------------------------------------------------- asset class
@@ -331,9 +437,14 @@ type Candle struct {
 	QuoteVolume float64
 }
 
+// granularity maps lower-cased nofx timeframes to Bitget candle granularities. It covers every
+// timeframe market.SupportedTimeframes() accepts (1m..1d, including 2h: Bitget accepts "2H",
+// verified live) plus 3d and 1w. Bitget's monthly "1M" cannot be keyed here because the lookup
+// lower-cases its input and "1m" is the minute bar. Bitget has no 8H bar, so "8h" stays unsupported.
 var granularity = map[string]string{
 	"1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
-	"1h": "1H", "4h": "4H", "6h": "6H", "12h": "12H", "1d": "1D", "1w": "1W",
+	"1h": "1H", "2h": "2H", "4h": "4H", "6h": "6H", "12h": "12H",
+	"1d": "1D", "3d": "3D", "1w": "1W",
 }
 
 // Granularity maps a nofx timeframe ("5m", "1h", "4h", "1d") to Bitget's value.

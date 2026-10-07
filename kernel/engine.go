@@ -14,6 +14,7 @@ import (
 	"nofx/store"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -195,13 +196,39 @@ type StrategyEngine struct {
 	config       *store.StrategyConfig
 	nofxosClient *nofxos.Client
 	marketSource market.Source // where market data comes from (default: legacy routing)
-	traderPrompt string        // per-trader custom prompt (appended after the strategy prompt)
+
+	// Per-trader custom prompt. It is written from HTTP handlers (PUT /traders/:id/prompt) while
+	// the trading loop calls BuildSystemPrompt, so it is guarded by promptMu.
+	promptMu               sync.RWMutex
+	traderPrompt           string // per-trader custom prompt
+	overrideStrategyPrompt bool   // trader prompt replaces the strategy's own CustomPrompt section
 }
 
-// SetTraderPrompt sets the per-trader custom prompt. It supplements the strategy's
-// own CustomPrompt so trader-level instructions are not silently dropped.
-func (e *StrategyEngine) SetTraderPrompt(prompt string) {
+// SetTraderPrompt sets the per-trader custom prompt together with its override mode. It is safe
+// to call concurrently with BuildSystemPrompt.
+//
+// override=false: the trader prompt supplements the strategy. The strategy's own CustomPrompt
+// section ("Personalized Trading Strategy") is kept and the trader prompt is appended after it
+// as "Trader-Specific Instructions".
+//
+// override=true: the trader prompt REPLACES the strategy's own CustomPrompt section: it is
+// emitted under the "Personalized Trading Strategy" heading and the strategy's CustomPrompt is
+// left out. Only that section is replaceable. The core sections stay in every case: schema,
+// role, trading rules, risk controls, indicators, decision process and the output format,
+// because response parsing and the risk limits depend on them. An empty trader prompt never
+// overrides anything (there is nothing to replace the strategy prompt with).
+func (e *StrategyEngine) SetTraderPrompt(prompt string, override bool) {
+	e.promptMu.Lock()
 	e.traderPrompt = strings.TrimSpace(prompt)
+	e.overrideStrategyPrompt = override
+	e.promptMu.Unlock()
+}
+
+// traderPromptState returns a consistent snapshot of the trader prompt and its override flag.
+func (e *StrategyEngine) traderPromptState() (prompt string, override bool) {
+	e.promptMu.RLock()
+	defer e.promptMu.RUnlock()
+	return e.traderPrompt, e.overrideStrategyPrompt
 }
 
 // NewStrategyEngine creates strategy execution engine
@@ -1000,19 +1027,29 @@ func (e *StrategyEngine) BuildSystemPrompt(accountEquity float64, variant string
 	sb.WriteString("- Required when opening: leverage, position_size_usd, stop_loss, take_profit, confidence, risk_usd\n")
 	sb.WriteString("- **IMPORTANT**: All numeric values must be calculated numbers, NOT formulas/expressions (e.g., use `27.76` not `3000 * 0.01`)\n\n")
 
-	// 8. Custom Prompt
-	if e.config.CustomPrompt != "" {
+	// 8./9. Custom prompts. The strategy's CustomPrompt and the per-trader prompt are the only
+	// parts of the prompt a trader may replace: with override the trader prompt takes the place
+	// of the strategy CustomPrompt, while every section above (rules, risk controls, output
+	// format) stays because response parsing and the risk limits depend on it.
+	traderPrompt, overrideStrategy := e.traderPromptState()
+	switch {
+	case traderPrompt != "" && overrideStrategy:
 		sb.WriteString("# 📌 Personalized Trading Strategy\n\n")
-		sb.WriteString(e.config.CustomPrompt)
+		sb.WriteString(traderPrompt)
 		sb.WriteString("\n\n")
 		sb.WriteString("Note: The above personalized strategy is a supplement to the basic rules and cannot violate the basic risk control principles.\n")
-	}
-
-	// 9. Per-trader custom prompt
-	if e.traderPrompt != "" {
-		sb.WriteString("\n# 📌 Trader-Specific Instructions\n\n")
-		sb.WriteString(e.traderPrompt)
-		sb.WriteString("\n\nNote: These trader-specific instructions supplement the rules above and cannot violate the basic risk control principles.\n")
+	default:
+		if e.config.CustomPrompt != "" {
+			sb.WriteString("# 📌 Personalized Trading Strategy\n\n")
+			sb.WriteString(e.config.CustomPrompt)
+			sb.WriteString("\n\n")
+			sb.WriteString("Note: The above personalized strategy is a supplement to the basic rules and cannot violate the basic risk control principles.\n")
+		}
+		if traderPrompt != "" {
+			sb.WriteString("\n# 📌 Trader-Specific Instructions\n\n")
+			sb.WriteString(traderPrompt)
+			sb.WriteString("\n\nNote: These trader-specific instructions supplement the rules above and cannot violate the basic risk control principles.\n")
+		}
 	}
 
 	return sb.String()

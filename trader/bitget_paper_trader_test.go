@@ -770,6 +770,134 @@ func TestPaperFundingUsesContractInterval(t *testing.T) {
 	near(t, "4h interval settles at 04:00", mustFloat(t, balanceOf(t, p), "totalEquity")-base, -0.1)
 }
 
+func setPaperFundInterval(src *fakePaperSource, symbol string, hours int) {
+	src.mu.Lock()
+	src.contracts[symbol].FundInterval = hours
+	src.mu.Unlock()
+}
+
+// The funding marker is a timestamp: when the exchange shortens the interval from 8h to 1h while
+// a position is open, only the 1h boundaries that really passed since the open are settled
+// (a slot index in units of the old interval would produce a burst of bogus payments).
+func TestPaperFundingIntervalShortenedWhileOpen(t *testing.T) {
+	p, src, clk := newTestPaper(t, 10000)
+	clk.Set(time.Date(2026, 10, 5, 7, 59, 0, 0, time.UTC))
+	if _, err := p.OpenLong("BTCUSDT", 10, 10); err != nil { // 8h interval at open
+		t.Fatal(err)
+	}
+	src.setRate("BTCUSDT", 0.0001)
+	setPaperFundInterval(src, "BTCUSDT", 1)
+
+	base := mustFloat(t, balanceOf(t, p), "totalEquity")
+	perPayment := 100 * 10 * 0.0001 // mark 100 * qty 10 * rate
+
+	// 10:00:05 -> boundaries 08:00, 09:00, 10:00 passed since the 07:59 open
+	clk.Set(time.Date(2026, 10, 5, 10, 0, 5, 0, time.UTC))
+	p.Tick()
+	near(t, "exactly 3 hourly payments", mustFloat(t, balanceOf(t, p), "totalEquity")-base, -3*perPayment)
+
+	p.Tick()
+	near(t, "idempotent within the hour", mustFloat(t, balanceOf(t, p), "totalEquity")-base, -3*perPayment)
+
+	clk.Set(time.Date(2026, 10, 5, 11, 0, 1, 0, time.UTC))
+	p.Tick()
+	near(t, "one more payment at 11:00", mustFloat(t, balanceOf(t, p), "totalEquity")-base, -4*perPayment)
+
+	// the marker survives a snapshot round trip as a timestamp
+	p.mu.Lock()
+	snap := p.snapshotLocked()
+	p.mu.Unlock()
+	want := time.Date(2026, 10, 5, 11, 0, 0, 0, time.UTC).Unix()
+	if snap.Version != paperSnapshotVersion || len(snap.Positions) != 1 || snap.Positions[0].FundingBoundary != want || snap.LastFundingAt != want {
+		t.Fatalf("snapshot funding markers: version=%d positions=%+v last=%d, want boundary %d", snap.Version, snap.Positions, snap.LastFundingAt, want)
+	}
+}
+
+// Lengthening the interval (1h -> 8h) must not pay anything until the next 8h boundary.
+func TestPaperFundingIntervalLengthenedWhileOpen(t *testing.T) {
+	p, src, clk := newTestPaper(t, 10000)
+	setPaperFundInterval(src, "BTCUSDT", 1)
+	clk.Set(time.Date(2026, 10, 5, 8, 30, 0, 0, time.UTC))
+	if _, err := p.OpenLong("BTCUSDT", 10, 10); err != nil {
+		t.Fatal(err)
+	}
+	src.setRate("BTCUSDT", 0.0001)
+	setPaperFundInterval(src, "BTCUSDT", 8)
+	base := mustFloat(t, balanceOf(t, p), "totalEquity")
+
+	clk.Set(time.Date(2026, 10, 5, 15, 59, 0, 0, time.UTC))
+	p.Tick()
+	near(t, "no payment before 16:00", mustFloat(t, balanceOf(t, p), "totalEquity"), base)
+
+	clk.Set(time.Date(2026, 10, 5, 16, 0, 1, 0, time.UTC))
+	p.Tick()
+	near(t, "one payment at 16:00", mustFloat(t, balanceOf(t, p), "totalEquity")-base, -0.1)
+}
+
+// Without a contract the interval is unknown: funding must be retried, not settled on a guessed grid.
+func TestPaperFundingWaitsForContract(t *testing.T) {
+	p, src, clk := newTestPaper(t, 10000)
+	clk.Set(time.Date(2026, 10, 5, 7, 59, 0, 0, time.UTC))
+	if _, err := p.OpenLong("BTCUSDT", 10, 10); err != nil {
+		t.Fatal(err)
+	}
+	src.setRate("BTCUSDT", 0.0001)
+	base := mustFloat(t, balanceOf(t, p), "totalEquity")
+
+	src.mu.Lock()
+	saved := src.contracts["BTCUSDT"]
+	delete(src.contracts, "BTCUSDT")
+	src.mu.Unlock()
+	clk.Set(time.Date(2026, 10, 5, 8, 0, 5, 0, time.UTC))
+	p.Tick()
+	near(t, "nothing settled while the contract is unavailable", mustFloat(t, balanceOf(t, p), "totalEquity"), base)
+
+	src.mu.Lock()
+	src.contracts["BTCUSDT"] = saved
+	src.mu.Unlock()
+	p.Tick()
+	near(t, "settled once the contract is back", mustFloat(t, balanceOf(t, p), "totalEquity")-base, -0.1)
+}
+
+func TestPaperFundingCatchUpIsCapped(t *testing.T) {
+	p, src, clk := newTestPaper(t, 10000)
+	setPaperFundInterval(src, "BTCUSDT", 1)
+	clk.Set(time.Date(2026, 10, 1, 0, 30, 0, 0, time.UTC))
+	if _, err := p.OpenLong("BTCUSDT", 10, 10); err != nil {
+		t.Fatal(err)
+	}
+	src.setRate("BTCUSDT", 0.00001)
+	base := mustFloat(t, balanceOf(t, p), "totalEquity")
+	clk.Set(time.Date(2026, 10, 20, 0, 0, 1, 0, time.UTC)) // ~455 hourly boundaries later
+	p.Tick()
+	near(t, "capped at paperMaxFundingCatchUp payments", mustFloat(t, balanceOf(t, p), "totalEquity")-base, -float64(paperMaxFundingCatchUp)*100*10*0.00001)
+	// the remainder is dropped, not carried over
+	p.Tick()
+	near(t, "no further payments in the same hour", mustFloat(t, balanceOf(t, p), "totalEquity")-base, -float64(paperMaxFundingCatchUp)*100*10*0.00001)
+}
+
+func TestPaperFundingBoundaryMath(t *testing.T) {
+	at := func(h, m int) time.Time { return time.Date(2026, 10, 5, h, m, 0, 0, time.UTC) }
+	if got, want := paperFundingBoundary(at(9, 30), 8), at(8, 0).Unix(); got != want {
+		t.Errorf("boundary 8h = %d, want %d", got, want)
+	}
+	if got, want := paperFundingBoundary(at(9, 30), 4), at(8, 0).Unix(); got != want {
+		t.Errorf("boundary 4h = %d, want %d", got, want)
+	}
+	if got, want := paperFundingBoundary(at(8, 0), 8), at(8, 0).Unix(); got != want {
+		t.Errorf("boundary exactly on the grid = %d, want %d", got, want)
+	}
+	if n := paperFundingDue(at(10, 0), 1, at(7, 59).Unix()); n != 3 {
+		t.Errorf("due 1h = %d, want 3", n)
+	}
+	if n := paperFundingDue(at(9, 0), 8, at(8, 0).Unix()); n != 0 {
+		t.Errorf("due right after a settlement = %d, want 0", n)
+	}
+	if n := paperFundingDue(at(9, 0), 8, at(12, 0).Unix()); n != 0 {
+		t.Errorf("marker in the future must not go negative, got %d", n)
+	}
+}
+
 func TestPaperFundingCanLiquidate(t *testing.T) {
 	p, src, clk := newTestPaper(t, 10000)
 	clk.Set(time.Date(2026, 10, 5, 7, 59, 0, 0, time.UTC))

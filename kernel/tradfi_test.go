@@ -213,13 +213,42 @@ func TestDropUntradableOpensKeepsOtherDecisions(t *testing.T) {
 	}
 }
 
+func TestDropUntradableOpensDropsUnknownSymbol(t *testing.T) {
+	withEnv(t, et(2026, 1, 7, 11)) // Wednesday: everything open
+
+	ds := []Decision{
+		{Symbol: "BTCUSDT", Action: "close_long"},
+		*openDecision("FOOUSDT", 3), // not in the contract list: lookup fails
+		*openDecision("SOLUSDT", 3),
+	}
+	got := dropUntradableOpens(ds, tradFiEnv())
+	if len(got) != 2 || got[0].Symbol != "BTCUSDT" || got[0].Action != "close_long" || got[1].Symbol != "SOLUSDT" {
+		t.Fatalf("unknown-symbol open must be dropped, others kept: %+v", got)
+	}
+	if err := validateDecisions(got, 10000, 5, 4, 5, 1, tradFiEnv()); err != nil {
+		t.Fatalf("remaining decisions should validate: %v", err)
+	}
+
+	// Without the drop the unknown open would reject the whole batch.
+	if err := validateDecisions(ds, 10000, 5, 4, 5, 1, tradFiEnv()); err == nil {
+		t.Fatal("sanity: the unfiltered batch is expected to fail validation")
+	}
+
+	// A lookup (network) error is treated the same way.
+	bitgetContractLookup = func(string) (*bitget.Contract, error) { return nil, fmt.Errorf("network down") }
+	only := []Decision{{Symbol: "BTCUSDT", Action: "close_long"}, *openDecision("BTCUSDT", 3)}
+	if out := dropUntradableOpens(only, tradFiEnv()); len(out) != 1 || out[0].Action != "close_long" {
+		t.Fatalf("open with failing lookup must be dropped, close kept: %+v", out)
+	}
+}
+
 func TestBuildSystemPromptIncludesTraderPrompt(t *testing.T) {
 	cfg := store.GetDefaultStrategyConfig("en")
 	e := NewStrategyEngine(&cfg)
 	if strings.Contains(e.BuildSystemPrompt(10000, "balanced"), "Trader-Specific Instructions") {
 		t.Fatal("no trader prompt set: section must be absent")
 	}
-	e.SetTraderPrompt("  keep at most 2 positions  ")
+	e.SetTraderPrompt("  keep at most 2 positions  ", false)
 	sp := e.BuildSystemPrompt(10000, "balanced")
 	if !strings.Contains(sp, "Trader-Specific Instructions") || !strings.Contains(sp, "keep at most 2 positions") {
 		t.Fatal("trader prompt must be included in the system prompt")

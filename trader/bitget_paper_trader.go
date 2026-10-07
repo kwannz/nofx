@@ -36,7 +36,11 @@ import (
 //     whole position with a market fill (with slippage and fee).
 //   - Funding settles at UTC boundaries aligned to the contract's fundInterval (8h ->
 //     00:00/08:00/16:00) using the CURRENT funding rate: longs pay when the rate is
-//     positive. The amount is added to / removed from the position margin.
+//     positive. The amount is added to / removed from the position margin. Progress is
+//     tracked per position as the unix time funding has been settled through (the open time
+//     at first, the last settled boundary afterwards) and the due boundaries are counted
+//     with the interval of the moment, so a fundInterval change on the exchange only moves
+//     the grid instead of corrupting a stored slot index.
 //   - State is kept in memory and snapshotted to disk (JSON, atomic replace) after every
 //     mutation, keyed by trader ID (see bitget_paper_state.go). A restart restores balance,
 //     positions, SL/TP and history; AutoTrader.Run then reconciles the database positions.
@@ -66,15 +70,15 @@ type BitgetPaperTrader struct {
 	closed    []ClosedPnLRecord
 	seq       uint64
 	realized  float64 // cumulative gross price PnL of closing fills
-	// lastFundingSlot is the most recent funding slot settled for any position (bookkeeping
-	// only: the per-position fundingSlot decides what is still due).
-	lastFundingSlot int64
-	dirty           bool // matcher changed state (funding) that still has to be persisted
-	lastMark        map[string]float64
-	markCache       map[string]paperMarkEntry
-	onSysFill       func(PaperFill)
-	stopCh          chan struct{}
-	matcherEnd      chan struct{}
+	// lastFundingAt is the most recent funding boundary (unix seconds) settled for any
+	// position (bookkeeping only: the per-position fundedThrough decides what is still due).
+	lastFundingAt int64
+	dirty         bool // matcher changed state (funding) that still has to be persisted
+	lastMark      map[string]float64
+	markCache     map[string]paperMarkEntry
+	onSysFill     func(PaperFill)
+	stopCh        chan struct{}
+	matcherEnd    chan struct{}
 
 	// persistence (bitget_paper_state.go); statePath == "" means in-memory only
 	traderID      string
@@ -146,18 +150,21 @@ type paperTrigger struct {
 }
 
 type paperPosition struct {
-	id          string
-	symbol      string
-	side        string // "long" / "short"
-	qty         float64
-	entry       float64
-	leverage    int
-	margin      float64 // locked margin incl. funding adjustments
-	openFee     float64 // opening fees still attributed to the open quantity
-	funding     float64 // cumulative funding received (+) / paid (-)
-	openedAt    time.Time
-	fundingSlot int64 // last funding slot already settled
-	sl, tp      *paperTrigger
+	id       string
+	symbol   string
+	side     string // "long" / "short"
+	qty      float64
+	entry    float64
+	leverage int
+	margin   float64 // locked margin incl. funding adjustments
+	openFee  float64 // opening fees still attributed to the open quantity
+	funding  float64 // cumulative funding received (+) / paid (-)
+	openedAt time.Time
+	// fundedThrough is the unix time (seconds) funding has been settled through: the open time
+	// for a new position, the last settled funding boundary afterwards. It is a timestamp, not
+	// a slot index, so it stays meaningful when the contract's fundInterval changes.
+	fundedThrough int64
+	sl, tp        *paperTrigger
 }
 
 func (p *paperPosition) dir() float64 {
@@ -368,13 +375,10 @@ func ReleaseBitgetPaperTrader(traderID string) {
 
 // ------------------------------------------------------------------- helpers
 
+// paperSymbol normalizes a symbol to the Bitget contract name (same rules as the market data
+// source: upper case, no xyz: prefix, USDT suffix).
 func paperSymbol(symbol string) string {
-	s := strings.ToUpper(strings.TrimSpace(symbol))
-	s = strings.TrimPrefix(s, "XYZ:")
-	if s != "" && !strings.HasSuffix(s, "USDT") {
-		s += "USDT"
-	}
-	return s
+	return market.NormalizeForSource(symbol, market.SourceBitget)
 }
 
 func paperFeeRate(c *bitgetapi.Contract) float64 {
@@ -391,8 +395,32 @@ func paperFundHours(c *bitgetapi.Contract) int {
 	return paperDefaultFundHours
 }
 
-func paperFundingSlot(t time.Time, hours int) int64 {
-	return t.UTC().Unix() / int64(hours*3600)
+// paperFundingBoundary returns the most recent funding boundary (unix seconds, UTC-aligned to
+// multiples of the interval) at or before t.
+func paperFundingBoundary(t time.Time, hours int) int64 {
+	step := int64(hours) * 3600
+	u := t.UTC().Unix()
+	return u - ((u%step)+step)%step
+}
+
+// paperFundingDue returns how many funding boundaries of the given interval lie in
+// (settledThrough, now]. It is negative-safe: a marker in the future (clock moved back) yields 0.
+func paperFundingDue(now time.Time, hours int, settledThrough int64) int64 {
+	step := int64(hours) * 3600
+	u := now.UTC().Unix()
+	n := paperFloorDiv(u, step) - paperFloorDiv(settledThrough, step)
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+func paperFloorDiv(a, b int64) int64 {
+	q := a / b
+	if a%b != 0 && (a < 0) != (b < 0) {
+		q--
+	}
+	return q
 }
 
 // paperStep returns the contract's quantity step.
@@ -685,16 +713,16 @@ func (t *BitgetPaperTrader) open(symbol, side string, quantity float64, leverage
 	t.cash -= margin + fee
 	if pos == nil {
 		pos = &paperPosition{
-			id:          t.nextIDLocked("paperpos"),
-			symbol:      symbol,
-			side:        side,
-			qty:         qty,
-			entry:       execPrice,
-			leverage:    lev,
-			margin:      margin,
-			openFee:     fee,
-			openedAt:    now,
-			fundingSlot: paperFundingSlot(now, paperFundHours(c)),
+			id:            t.nextIDLocked("paperpos"),
+			symbol:        symbol,
+			side:          side,
+			qty:           qty,
+			entry:         execPrice,
+			leverage:      lev,
+			margin:        margin,
+			openFee:       fee,
+			openedAt:      now,
+			fundedThrough: now.UTC().Unix(),
 		}
 		t.positions[symbol] = pos
 	} else {
@@ -702,7 +730,9 @@ func (t *BitgetPaperTrader) open(symbol, side string, quantity float64, leverage
 		pos.qty += qty
 		pos.margin += margin
 		pos.openFee += fee
-		pos.leverage = int(math.Max(1, math.Round(pos.entry*pos.qty/pos.margin)))
+		if pos.margin > 0 { // funding can push the margin to <= 0: keep the leverage then
+			pos.leverage = int(math.Max(1, math.Round(pos.entry*pos.qty/pos.margin)))
+		}
 	}
 
 	f := &PaperFill{
@@ -782,10 +812,12 @@ func (t *BitgetPaperTrader) closeLocked(pos *paperPosition, qty, execPrice, feeR
 	gross := pos.dir() * (execPrice - pos.entry) * qty
 	fee := execPrice * qty * feeRate
 
-	if marginPart+gross < 0 {
+	if marginPart+gross < 0 && marginPart >= 0 {
 		gross = -marginPart // loss beyond the margin is absorbed by the (unmodelled) insurance fund
 	}
-	remaining := marginPart + gross
+	// A negative margin (funding paid beyond the posted margin) is a debt against the position's
+	// own PnL: the realized price PnL stays as is and only the payout is floored at zero.
+	remaining := math.Max(0, marginPart+gross)
 	if reason == paperReasonLiquidation || remaining-fee < 0 {
 		fee = remaining // clearance fee: the leftover equity is forfeited
 	}
@@ -1099,13 +1131,13 @@ func (t *BitgetPaperTrader) Tick() {
 	defer t.tickMu.Unlock()
 
 	type held struct {
-		symbol string
-		slot   int64
+		symbol        string
+		fundedThrough int64
 	}
 	t.mu.Lock()
 	snapshot := make([]held, 0, len(t.positions))
 	for _, p := range t.sortedPositionsLocked() {
-		snapshot = append(snapshot, held{p.symbol, p.fundingSlot})
+		snapshot = append(snapshot, held{p.symbol, p.fundedThrough})
 	}
 	t.mu.Unlock()
 	if len(snapshot) == 0 {
@@ -1125,7 +1157,7 @@ func (t *BitgetPaperTrader) Tick() {
 		if c, err := t.source.Contract(h.symbol); err == nil {
 			d.c = c
 		}
-		if paperFundingSlot(now, paperFundHours(d.c)) > h.slot {
+		if d.c != nil && paperFundingDue(now, paperFundHours(d.c), h.fundedThrough) > 0 {
 			if r, err := t.source.FundingRate(h.symbol); err == nil {
 				d.rate, d.rateOK = r, true
 			} else {
@@ -1166,20 +1198,24 @@ func (t *BitgetPaperTrader) matchPositionLocked(pos *paperPosition, d paperTickD
 	mark := d.mark
 	t.lastMark[pos.symbol] = mark
 
-	// 1) funding: one settlement per elapsed boundary, using the current rate
-	if d.rateOK {
-		slot := paperFundingSlot(now, paperFundHours(d.c))
-		if n := slot - pos.fundingSlot; n > 0 {
+	// 1) funding: one settlement per elapsed boundary, using the current rate. Needs the
+	// contract: without it the interval is unknown and guessing one could count boundaries on a
+	// wrong grid, so settlement is simply retried on the next tick.
+	if d.rateOK && d.c != nil {
+		hours := paperFundHours(d.c)
+		if n := paperFundingDue(now, hours, pos.fundedThrough); n > 0 {
 			if n > paperMaxFundingCatchUp {
+				logger.Warnf("  ⚠️ [BitgetPaper] %s %s: %d funding boundaries due, settling only the last %d", pos.symbol, pos.side, n, paperMaxFundingCatchUp)
 				n = paperMaxFundingCatchUp
 			}
 			// long pays when rate > 0, short receives (and vice versa)
 			delta := -pos.dir() * pos.qty * mark * d.rate * float64(n)
 			pos.margin += delta
 			pos.funding += delta
-			pos.fundingSlot = slot
-			if slot > t.lastFundingSlot {
-				t.lastFundingSlot = slot
+			boundary := paperFundingBoundary(now, hours)
+			pos.fundedThrough = boundary
+			if boundary > t.lastFundingAt {
+				t.lastFundingAt = boundary
 			}
 			t.dirty = true
 			logger.Infof("  💸 [BitgetPaper] funding %s %s rate=%.6f x%d -> %+.4f USDT", pos.symbol, pos.side, d.rate, n, delta)

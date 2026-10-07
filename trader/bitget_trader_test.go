@@ -30,6 +30,13 @@ type fakeBitget struct {
 	reqs     []bitgetRecReq
 	data     map[string]string // path -> JSON data
 	errCodes map[string][2]string
+	// failFirst makes the first N requests to a path fail (then succeed): path -> remaining count + error.
+	failFirst map[string]*bitgetFailFirst
+}
+
+type bitgetFailFirst struct {
+	remaining int
+	code, msg string
 }
 
 const bitgetTestContracts = `[{"symbol":"BTCUSDT","baseCoin":"BTC","quoteCoin":"USDT","minTradeNum":"0.001","priceEndStep":"5","volumePlace":"3","pricePlace":"1","sizeMultiplier":"0.001","minTradeUSDT":"5","maxLever":"125","symbolStatus":"normal","isRwa":"NO","takerFeeRate":"0.0006","makerFeeRate":"0.0002","fundInterval":"8","maxOrderQty":"1200"}]`
@@ -39,6 +46,8 @@ func newFakeBitget(t *testing.T) *fakeBitget {
 		t:        t,
 		data:     map[string]string{},
 		errCodes: map[string][2]string{},
+
+		failFirst: map[string]*bitgetFailFirst{},
 	}
 	f.data[bitgetContractsPath] = bitgetTestContracts
 	f.data[bitgetTickerPath] = `[{"symbol":"BTCUSDT","lastPr":"50000"}]`
@@ -65,6 +74,10 @@ func newFakeBitget(t *testing.T) *fakeBitget {
 		f.reqs = append(f.reqs, rec)
 		data, ok := f.data[r.URL.Path]
 		ec, isErr := f.errCodes[r.URL.Path]
+		if ff := f.failFirst[r.URL.Path]; ff != nil && ff.remaining > 0 {
+			ff.remaining--
+			ec, isErr = [2]string{ff.code, ff.msg}, true
+		}
 		f.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		if isErr {
@@ -90,6 +103,13 @@ func (f *fakeBitget) set(path, data string) {
 func (f *fakeBitget) fail(path, code, msg string) {
 	f.mu.Lock()
 	f.errCodes[path] = [2]string{code, msg}
+	f.mu.Unlock()
+}
+
+// failFirstN makes the first n requests to path fail with the given code, then succeed again.
+func (f *fakeBitget) failFirstN(path string, n int, code, msg string) {
+	f.mu.Lock()
+	f.failFirst[path] = &bitgetFailFirst{remaining: n, code: code, msg: msg}
 	f.mu.Unlock()
 }
 
@@ -345,6 +365,88 @@ func TestBitgetSetStopLossReplacesExistingSameType(t *testing.T) {
 	if len(order) != 2 || order[0] != bitgetCancelPlanPath {
 		t.Errorf("call order = %v", order)
 	}
+}
+
+// If the replacement TP/SL is rejected after the old one was cancelled, the old trigger must be
+// re-placed so the live position stays protected.
+func TestBitgetPlaceTPSLRestoresPreviousOnFailure(t *testing.T) {
+	existing := `{"entrustedList":[{"orderId":"1","planType":"pos_loss","triggerPrice":"95","side":"sell","posSide":"net","symbol":"BTCUSDT"}]}`
+
+	t.Run("restore succeeds", func(t *testing.T) {
+		tr, f := newTestBitget(t, false)
+		f.set(bitgetPlanPendingPath, existing)
+		f.failFirstN(bitgetPlaceTPSLPath, 1, "40917", "trigger price invalid")
+
+		err := tr.SetStopLoss("BTCUSDT", "LONG", 0, 94)
+		if err == nil {
+			t.Fatal("expected error when the new SL is rejected")
+		}
+		if !strings.Contains(err.Error(), "40917") || !strings.Contains(err.Error(), "restored @ 95") {
+			t.Errorf("error should carry the cause and the restore result: %v", err)
+		}
+		if strings.Contains(err.Error(), "NOT restored") {
+			t.Errorf("restore succeeded, error must not say otherwise: %v", err)
+		}
+		places := f.find(bitgetPlaceTPSLPath)
+		if len(places) != 2 {
+			t.Fatalf("want attempted place + restore = 2 place requests, got %d", len(places))
+		}
+		if places[0].Body["triggerPrice"] != "94.0" {
+			t.Errorf("first place should be the new trigger, got %v", places[0].Body["triggerPrice"])
+		}
+		restore := places[1].Body
+		if restore["triggerPrice"] != "95" || restore["planType"] != "pos_loss" || restore["holdSide"] != "buy" ||
+			restore["symbol"] != "BTCUSDT" || restore["triggerType"] != "mark_price" {
+			t.Errorf("restore body = %v", restore)
+		}
+		if n := len(f.find(bitgetCancelPlanPath)); n != 1 {
+			t.Errorf("cancel requests = %d, want 1", n)
+		}
+	})
+
+	t.Run("restore fails too", func(t *testing.T) {
+		tr, f := newTestBitget(t, false)
+		f.set(bitgetPlanPendingPath, existing)
+		f.fail(bitgetPlaceTPSLPath, "40917", "trigger price invalid")
+
+		err := tr.SetStopLoss("BTCUSDT", "LONG", 0, 94)
+		if err == nil || !strings.Contains(err.Error(), "NOT restored") || !strings.Contains(err.Error(), "unprotected") {
+			t.Fatalf("error must say the restore failed: %v", err)
+		}
+		if n := len(f.find(bitgetPlaceTPSLPath)); n != 2 {
+			t.Errorf("place requests = %d, want 2 (attempt + restore)", n)
+		}
+	})
+
+	t.Run("no previous order means no restore", func(t *testing.T) {
+		tr, f := newTestBitget(t, false)
+		f.fail(bitgetPlaceTPSLPath, "40917", "trigger price invalid")
+
+		err := tr.SetStopLoss("BTCUSDT", "LONG", 0, 94)
+		if err == nil || strings.Contains(err.Error(), "restored") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if n := len(f.find(bitgetPlaceTPSLPath)); n != 1 {
+			t.Errorf("place requests = %d, want 1", n)
+		}
+	})
+
+	t.Run("take profit restores only its own side and kind", func(t *testing.T) {
+		tr, f := newTestBitget(t, false)
+		f.set(bitgetPlanPendingPath, `{"entrustedList":[
+			{"orderId":"1","planType":"pos_loss","triggerPrice":"95","holdSide":"buy","symbol":"BTCUSDT"},
+			{"orderId":"2","planType":"pos_profit","triggerPrice":"120","holdSide":"buy","symbol":"BTCUSDT"},
+			{"orderId":"3","planType":"pos_profit","triggerPrice":"80","holdSide":"sell","symbol":"BTCUSDT"}]}`)
+		f.failFirstN(bitgetPlaceTPSLPath, 1, "40917", "boom")
+
+		if err := tr.SetTakeProfit("BTCUSDT", "LONG", 0, 130); err == nil {
+			t.Fatal("expected error")
+		}
+		places := f.find(bitgetPlaceTPSLPath)
+		if len(places) != 2 || places[1].Body["triggerPrice"] != "120" || places[1].Body["planType"] != "pos_profit" {
+			t.Errorf("restore should re-place only the long TP @120: %+v", places)
+		}
+	})
 }
 
 func TestBitgetCancelFlow(t *testing.T) {

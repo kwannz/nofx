@@ -932,15 +932,15 @@ func (t *BitgetTrader) cancelPlanOrderIDs(symbol string, ids []string) error {
 	return nil
 }
 
-// cancelTPSL cancels pending TP/SL orders of the given kinds. direction ("long"/"short"/"")
-// restricts the cancel to one position side when the exchange reports it.
-func (t *BitgetTrader) cancelTPSL(symbol string, kinds bitgetTPSLKind, direction string) error {
-	symbol = t.convertSymbol(symbol)
+// matchingPlanOrders returns the pending TP/SL plan orders of the given kinds for symbol.
+// direction ("long"/"short"/"") restricts the result to one position side when the
+// exchange reports it.
+func (t *BitgetTrader) matchingPlanOrders(symbol string, kinds bitgetTPSLKind, direction string) ([]bitgetPlanOrder, error) {
 	orders, err := t.listPlanOrders(symbol)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	var ids []string
+	var out []bitgetPlanOrder
 	for _, o := range orders {
 		if bitgetPlanKind(o.PlanType)&kinds == 0 {
 			continue
@@ -951,9 +951,28 @@ func (t *BitgetTrader) cancelTPSL(symbol string, kinds bitgetTPSLKind, direction
 		if d := planOrderDirection(o); direction != "" && d != "" && d != direction {
 			continue
 		}
+		out = append(out, o)
+	}
+	return out, nil
+}
+
+func planOrderIDs(orders []bitgetPlanOrder) []string {
+	ids := make([]string, 0, len(orders))
+	for _, o := range orders {
 		ids = append(ids, o.OrderId)
 	}
-	return t.cancelPlanOrderIDs(symbol, ids)
+	return ids
+}
+
+// cancelTPSL cancels pending TP/SL orders of the given kinds. direction ("long"/"short"/"")
+// restricts the cancel to one position side when the exchange reports it.
+func (t *BitgetTrader) cancelTPSL(symbol string, kinds bitgetTPSLKind, direction string) error {
+	symbol = t.convertSymbol(symbol)
+	orders, err := t.matchingPlanOrders(symbol, kinds, direction)
+	if err != nil {
+		return err
+	}
+	return t.cancelPlanOrderIDs(symbol, planOrderIDs(orders))
 }
 
 // roundBitgetPrice rounds to pricePlace decimals and to a multiple of priceEndStep.
@@ -963,7 +982,28 @@ func roundBitgetPrice(c *BitgetContract, price float64) string {
 	return strconv.FormatFloat(v, 'f', c.PricePlace, 64)
 }
 
+// postTPSL sends one place-tpsl-order request for a whole-position SL/TP.
+func (t *BitgetTrader) postTPSL(symbol, planType, holdSide, trigger string) error {
+	body := map[string]interface{}{
+		"marginCoin":   "USDT",
+		"productType":  bitgetProductType,
+		"symbol":       symbol,
+		"planType":     planType,
+		"triggerPrice": trigger,
+		"triggerType":  "mark_price",
+		"holdSide":     holdSide,
+		"clientOid":    genBitgetClientOid(),
+	}
+	_, err := t.doRequest("POST", bitgetPlaceTPSLPath, body)
+	return err
+}
+
 // placeTPSL places a whole-position stop loss / take profit via place-tpsl-order.
+//
+// Bitget may allow only one pos_loss / pos_profit per position, so the new order cannot be
+// placed before the old one is cancelled. The sequence is therefore cancel -> place, and when
+// the placement fails the previous trigger(s) are re-placed (best effort) so a live position
+// is not silently left without protection. The returned error says whether the restore worked.
 func (t *BitgetTrader) placeTPSL(symbol, positionSide string, price float64, planType, label string) error {
 	symbol = t.convertSymbol(symbol)
 
@@ -982,28 +1022,66 @@ func (t *BitgetTrader) placeTPSL(symbol, positionSide string, price float64, pla
 	if planType == "pos_profit" {
 		kind = bitgetKindTP
 	}
+
+	// Remember the existing order(s) of this kind/side so they can be restored on failure.
+	existing, err := t.matchingPlanOrders(symbol, kind, direction)
+	if err != nil {
+		return fmt.Errorf("failed to clear existing %s before placing new one: %w", label, err)
+	}
 	// Replace any existing order of the same type on this side
-	if err := t.cancelTPSL(symbol, kind, direction); err != nil {
+	if err := t.cancelPlanOrderIDs(symbol, planOrderIDs(existing)); err != nil {
 		return fmt.Errorf("failed to clear existing %s before placing new one: %w", label, err)
 	}
 
-	body := map[string]interface{}{
-		"marginCoin":   "USDT",
-		"productType":  bitgetProductType,
-		"symbol":       symbol,
-		"planType":     planType,
-		"triggerPrice": trigger,
-		"triggerType":  "mark_price",
-		"holdSide":     holdSide,
-		"clientOid":    genBitgetClientOid(),
+	placeErr := t.postTPSL(symbol, planType, holdSide, trigger)
+	if placeErr == nil {
+		logger.Infof("  ✓ [Bitget] %s set: %s @ %s", label, symbol, trigger)
+		return nil
+	}
+	if len(existing) == 0 {
+		return fmt.Errorf("failed to set %s: %w", label, placeErr)
 	}
 
-	if _, err := t.doRequest("POST", bitgetPlaceTPSLPath, body); err != nil {
-		return fmt.Errorf("failed to set %s: %w", label, err)
+	// The old order is already gone: try to put it back so the position stays protected.
+	restored, restoreErr := t.restoreTPSL(symbol, planType, holdSide, existing)
+	if restoreErr != nil {
+		logger.Errorf("  🚨 [Bitget] %s %s @ %s failed (%v) AND restoring the previous one failed (%v): position may be UNPROTECTED",
+			label, symbol, trigger, placeErr, restoreErr)
+		note := "NOT restored"
+		if len(restored) > 0 {
+			note = fmt.Sprintf("only partially restored (@ %s)", strings.Join(restored, ","))
+		}
+		return fmt.Errorf("failed to set %s: %w; previous %s %s (%v): position may be unprotected",
+			label, placeErr, label, note, restoreErr)
 	}
+	logger.Warnf("  ⚠️ [Bitget] %s %s @ %s failed (%v); previous %s restored @ %s",
+		label, symbol, trigger, placeErr, label, strings.Join(restored, ","))
+	return fmt.Errorf("failed to set %s: %w; previous %s restored @ %s",
+		label, placeErr, label, strings.Join(restored, ","))
+}
 
-	logger.Infof("  ✓ [Bitget] %s set: %s @ %s", label, symbol, trigger)
-	return nil
+// restoreTPSL re-places previously cancelled TP/SL plan orders (one per distinct trigger price).
+// It returns the trigger prices that were re-placed and the first error, if any.
+func (t *BitgetTrader) restoreTPSL(symbol, planType, holdSide string, prev []bitgetPlanOrder) ([]string, error) {
+	var restored []string
+	var errs []error
+	seen := map[string]bool{}
+	for _, o := range prev {
+		trig := strings.TrimSpace(o.TriggerPrice)
+		if trig == "" || seen[trig] {
+			continue
+		}
+		seen[trig] = true
+		if err := t.postTPSL(symbol, planType, holdSide, trig); err != nil {
+			errs = append(errs, fmt.Errorf("@%s: %w", trig, err))
+			continue
+		}
+		restored = append(restored, trig)
+	}
+	if len(restored) == 0 && len(errs) == 0 {
+		errs = append(errs, errors.New("previous order reported no trigger price"))
+	}
+	return restored, errors.Join(errs...)
 }
 
 // SetStopLoss sets a position stop loss (size is the whole position; quantity is unused)

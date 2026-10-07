@@ -3,6 +3,7 @@ package trader
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -138,10 +139,10 @@ func TestPaperSnapshotRoundTrip(t *testing.T) {
 		t.Fatalf("setup: positions %d orders %d closed %d", len(wantPos), len(wantOrders), len(wantClosed))
 	}
 	p.mu.Lock()
-	seqBefore, slotBefore := p.seq, p.lastFundingSlot
+	seqBefore, slotBefore := p.seq, p.lastFundingAt
 	p.mu.Unlock()
 	if slotBefore == 0 {
-		t.Fatal("funding settlement must be recorded in lastFundingSlot")
+		t.Fatal("funding settlement must be recorded in lastFundingAt")
 	}
 
 	// "restart": the registry entry is gone, only the file is left
@@ -194,7 +195,7 @@ func TestPaperSnapshotRoundTrip(t *testing.T) {
 	}
 	// counters and settings
 	p2.mu.Lock()
-	seqAfter, slotAfter := p2.seq, p2.lastFundingSlot
+	seqAfter, slotAfter := p2.seq, p2.lastFundingAt
 	lev, cross := p2.leverage["BTCUSDT"], p2.crossMode["BTCUSDT"]
 	initial := p2.initial
 	p2.mu.Unlock()
@@ -316,7 +317,7 @@ func TestPaperSnapshotBadFilesAreIgnored(t *testing.T) {
 		"garbage":         "this is not json {{{",
 		"truncated":       valid(1)[:40],
 		"empty":           "",
-		"unknown version": valid(2),
+		"unknown version": valid(paperSnapshotVersion + 1),
 		"version zero":    valid(0),
 		"negative qty":    strings.Replace(valid(1), `"qty":1`, `"qty":-1`, 1),
 		"bad side":        strings.Replace(valid(1), `"side":"long"`, `"side":"flat"`, 1),
@@ -718,4 +719,167 @@ func TestPaperSnapshotHandWrittenFileLoads(t *testing.T) {
 	if _, err := os.Stat(path + paperRejectedSuffix); !os.IsNotExist(err) {
 		t.Fatal("accepted snapshot must not be moved aside")
 	}
+}
+
+// Funding is charged against the position margin and can legitimately push it below zero while
+// the unrealized PnL keeps the position alive. Such a snapshot must load (the whole account used
+// to be discarded as "invalid") and the position must keep behaving.
+func TestPaperSnapshotNegativeMarginRoundTrips(t *testing.T) {
+	usePaperStateDir(t)
+	src := newFakePaperSource()
+	clk := &fakeClock{t: time.Date(2026, 10, 5, 7, 59, 0, 0, time.UTC)}
+	p := acquirePaper("t-negmargin", 10000, src, clk)
+	if _, err := p.OpenLong("BTCUSDT", 10, 10); err != nil { // margin ~100
+		t.Fatal(err)
+	}
+	// price rallies, then an absurd positive funding rate drains more than the posted margin
+	src.setMark("BTCUSDT", 120)
+	src.setRate("BTCUSDT", 0.15)
+	clk.Set(time.Date(2026, 10, 5, 8, 0, 5, 0, time.UTC))
+	p.Tick()
+
+	p.mu.Lock()
+	pos := p.positions["BTCUSDT"]
+	var margin float64
+	if pos != nil {
+		margin = pos.margin
+	}
+	p.mu.Unlock()
+	if pos == nil || margin >= 0 {
+		t.Fatalf("setup: position must survive with negative margin, got pos=%v margin=%v", pos != nil, margin)
+	}
+	wantSnapshot := canonicalSnapshot(t, p)
+	wantEquity := mustFloat(t, balanceOf(t, p), "totalEquity")
+
+	resetPaperRegistryForTest() // "restart"
+	p2 := acquirePaper("t-negmargin", 777, src, clk)
+	if got := canonicalSnapshot(t, p2); got != wantSnapshot {
+		t.Fatalf("negative-margin account was not restored\n got: %s\nwant: %s", got, wantSnapshot)
+	}
+	p2.mu.Lock()
+	gotMargin := p2.positions["BTCUSDT"].margin
+	p2.mu.Unlock()
+	near(t, "restored margin", gotMargin, margin)
+	near(t, "restored equity", mustFloat(t, balanceOf(t, p2), "totalEquity"), wantEquity)
+	if _, err := os.Stat(filepath.Join(PaperStateDir(), "t-negmargin.json"+paperRejectedSuffix)); err == nil {
+		t.Fatal("snapshot must not be rejected")
+	}
+
+	// liquidation is margin + uPnL <= maintenance: still alive at 120 ...
+	p2.Tick()
+	if len(mustPositions(t, p2)) != 1 {
+		t.Fatal("margin + uPnL is far above maintenance: must stay open")
+	}
+	// ... and liquidated once the price falls back, without a bogus positive realized PnL
+	src.setMark("BTCUSDT", 100)
+	p2.Tick()
+	if len(mustPositions(t, p2)) != 0 {
+		t.Fatal("margin + uPnL <= maintenance with negative margin: must be liquidated")
+	}
+	closed, _ := p2.GetClosedPnL(time.Time{}, 10)
+	if len(closed) != 1 || closed[0].CloseType != paperReasonLiquidation || closed[0].RealizedPnL > 0 {
+		t.Fatalf("liquidation record: %+v", closed)
+	}
+}
+
+// NaN / Inf are still rejected, a negative finite margin is not.
+func TestPaperSnapshotMarginValidation(t *testing.T) {
+	base := func(margin float64) *paperSnapshot {
+		return &paperSnapshot{
+			Version: paperSnapshotVersion, TraderID: "t", Initial: 1000, Cash: 900,
+			Positions: []paperPositionSnap{{ID: "p", Symbol: "BTCUSDT", Side: "long", Qty: 1, Entry: 100, Leverage: 5, Margin: margin, FundingBoundary: 1}},
+		}
+	}
+	for _, m := range []float64{20, 0, -35.5} {
+		if err := base(m).validate("t"); err != nil {
+			t.Errorf("margin %v must be valid: %v", m, err)
+		}
+	}
+	for _, m := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if err := base(m).validate("t"); err == nil {
+			t.Errorf("margin %v must be rejected", m)
+		}
+	}
+}
+
+// A v1 snapshot (funding slot index in units of the open-time interval) loads and its funding
+// markers are reset to the save time; boundaries that passed while the process was down are
+// settled once with the current interval, nothing else.
+func TestPaperSnapshotV1MigratesFundingMarkers(t *testing.T) {
+	write := func(t *testing.T, dir string, savedAt time.Time, slot int64) {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		v1 := map[string]interface{}{
+			"version": 1, "trader_id": "t-v1", "saved_at": savedAt, "initial_balance": 10000.0, "cash": 9900.0,
+			"realized_pnl": 0.0, "next_order_seq": 4, "last_funding_slot": slot,
+			"positions": []map[string]interface{}{{
+				"id": "paperpos-1", "symbol": "BTCUSDT", "side": "long", "qty": 10.0, "entry_price": 100.0,
+				"leverage": 10, "margin": 100.0, "open_fee": 0.6, "funding": 0.0,
+				"opened_at": savedAt, "funding_slot": slot,
+			}},
+			"leverage": map[string]int{"BTCUSDT": 10}, "cross_mode": map[string]bool{},
+			"fills": []interface{}{}, "closed_trades": []interface{}{},
+		}
+		b, _ := json.Marshal(v1)
+		if err := os.WriteFile(filepath.Join(dir, "t-v1.json"), b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("boundary passed while down is settled once", func(t *testing.T) {
+		dir := usePaperStateDir(t)
+		saved := time.Date(2026, 10, 5, 7, 59, 0, 0, time.UTC)
+		slot := saved.Unix() / (8 * 3600)
+		write(t, dir, saved, slot)
+		src := newFakePaperSource()
+		src.setRate("BTCUSDT", 0.0001)
+		clk := &fakeClock{t: time.Date(2026, 10, 5, 8, 30, 0, 0, time.UTC)}
+		p := acquirePaper("t-v1", 777, src, clk)
+		if len(mustPositions(t, p)) != 1 {
+			t.Fatal("v1 snapshot must be restored")
+		}
+		p.mu.Lock()
+		through := p.positions["BTCUSDT"].fundedThrough
+		p.mu.Unlock()
+		if through != saved.Unix() {
+			t.Fatalf("funding marker = %d, want save time %d", through, saved.Unix())
+		}
+		base := mustFloat(t, balanceOf(t, p), "totalEquity")
+		p.Tick()
+		near(t, "one 08:00 payment", mustFloat(t, balanceOf(t, p), "totalEquity")-base, -0.1)
+		p.Tick()
+		near(t, "no second payment", mustFloat(t, balanceOf(t, p), "totalEquity")-base, -0.1)
+
+		// the next write is a v2 snapshot
+		raw, err := os.ReadFile(filepath.Join(dir, "t-v1.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var onDisk struct {
+			Version int `json:"version"`
+		}
+		_ = json.Unmarshal(raw, &onDisk)
+		if onDisk.Version != paperSnapshotVersion || strings.Contains(string(raw), "funding_slot") {
+			t.Fatalf("migrated snapshot must be rewritten as v%d without legacy fields: %s", paperSnapshotVersion, raw)
+		}
+	})
+
+	t.Run("no spurious catch-up burst", func(t *testing.T) {
+		dir := usePaperStateDir(t)
+		saved := time.Date(2026, 10, 5, 8, 0, 10, 0, time.UTC)
+		// a large v1 index (e.g. from a 1h contract) must not be reinterpreted as 8h slots
+		write(t, dir, saved, 5_000_000)
+		src := newFakePaperSource()
+		src.setRate("BTCUSDT", 0.0001)
+		clk := &fakeClock{t: time.Date(2026, 10, 5, 15, 0, 0, 0, time.UTC)}
+		p := acquirePaper("t-v1", 777, src, clk)
+		base := mustFloat(t, balanceOf(t, p), "totalEquity")
+		p.Tick()
+		near(t, "no boundary between 08:00:10 and 15:00", mustFloat(t, balanceOf(t, p), "totalEquity"), base)
+		clk.Set(time.Date(2026, 10, 5, 16, 0, 1, 0, time.UTC))
+		p.Tick()
+		near(t, "single payment at 16:00", mustFloat(t, balanceOf(t, p), "totalEquity")-base, -0.1)
+	})
 }

@@ -109,8 +109,9 @@ type AutoTrader struct {
 	cycleNumber           int                      // Current cycle number
 	initialBalance        float64
 	dailyPnL              float64
-	customPrompt          string // Custom trading strategy prompt
-	overrideBasePrompt    bool   // Whether to override base prompt
+	promptMu              sync.Mutex // Protects customPrompt / overrideBasePrompt (HTTP updates vs. engine)
+	customPrompt          string     // Custom trading strategy prompt
+	overrideBasePrompt    bool       // Whether to override base prompt
 	lastResetTime         time.Time
 	stopUntil             time.Time
 	isRunning             bool
@@ -317,7 +318,7 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 		return nil, fmt.Errorf("[%s] strategy not configured", config.Name)
 	}
 	strategyEngine := kernel.NewStrategyEngine(config.StrategyConfig)
-	strategyEngine.SetMarketSource(marketSourceForExchange(config.Exchange))
+	strategyEngine.SetMarketSource(market.SourceForExchange(config.Exchange))
 	logger.Infof("✓ [%s] Using strategy engine (strategy configuration loaded)", config.Name)
 
 	return &AutoTrader{
@@ -1419,17 +1420,31 @@ func (at *AutoTrader) SetShowInCompetition(show bool) {
 	at.showInCompetition = show
 }
 
-// SetCustomPrompt sets custom trading strategy prompt
+// SetCustomPrompt sets the per-trader custom prompt. Together with SetOverrideBasePrompt it is
+// forwarded to the strategy engine; the pair is pushed on every change so the engine ends up
+// with both values whichever setter runs first (and from whichever goroutine).
 func (at *AutoTrader) SetCustomPrompt(prompt string) {
+	at.promptMu.Lock()
+	defer at.promptMu.Unlock()
 	at.customPrompt = prompt
-	if at.strategyEngine != nil {
-		at.strategyEngine.SetTraderPrompt(prompt)
-	}
+	at.syncTraderPromptLocked()
 }
 
-// SetOverrideBasePrompt sets whether to override base prompt
+// SetOverrideBasePrompt sets whether the trader prompt replaces the strategy's own custom
+// prompt section (the core rules and output format are never replaced, see
+// kernel.StrategyEngine.SetTraderPrompt).
 func (at *AutoTrader) SetOverrideBasePrompt(override bool) {
+	at.promptMu.Lock()
+	defer at.promptMu.Unlock()
 	at.overrideBasePrompt = override
+	at.syncTraderPromptLocked()
+}
+
+// syncTraderPromptLocked pushes the current prompt pair to the strategy engine. promptMu must be held.
+func (at *AutoTrader) syncTraderPromptLocked() {
+	if at.strategyEngine != nil {
+		at.strategyEngine.SetTraderPrompt(at.customPrompt, at.overrideBasePrompt)
+	}
 }
 
 // GetSystemPromptTemplate gets current system prompt template name (from strategy config)
@@ -2365,20 +2380,9 @@ func (at *AutoTrader) GetOpenOrders(symbol string) ([]OpenOrder, error) {
 }
 
 
-// marketSourceForExchange maps an exchange type to its market data source.
-// Bitget (live/demo and local paper) uses Bitget public data so TradFi symbols
-// such as NVDAUSDT / XAUUSDT resolve to the same venue that executes the orders.
-func marketSourceForExchange(exchange string) market.Source {
-	switch exchange {
-	case "bitget", "bitget_paper":
-		return market.SourceBitget
-	}
-	return market.SourceDefault
-}
-
 // marketSource returns the market data source for this trader's exchange.
 func (at *AutoTrader) marketSource() market.Source {
-	return marketSourceForExchange(at.exchange)
+	return market.SourceForExchange(at.exchange)
 }
 
 // normalizeSymbol normalizes a symbol consistently with the market data source
