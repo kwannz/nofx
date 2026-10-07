@@ -10,6 +10,7 @@ import (
 )
 
 func TestKline(t *testing.T) {
+	requireLiveTests(t)
 	resp, err := Kline(context.TODO(), "BTCUSDT", coinank_enum.Binance, time.Now().UnixMilli(), coinank_enum.To, 10, coinank_enum.Hour1)
 	if err != nil {
 		t.Error(err)
@@ -22,6 +23,7 @@ func TestKline(t *testing.T) {
 }
 
 func TestKlineDaily(t *testing.T) {
+	requireLiveTests(t)
 	resp, err := Kline(context.TODO(), "BTCUSDT", coinank_enum.Binance, time.Now().UnixMilli(), coinank_enum.To, 5, coinank_enum.Day1)
 	if err != nil {
 		t.Fatal(err)

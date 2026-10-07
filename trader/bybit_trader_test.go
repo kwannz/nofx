@@ -174,9 +174,19 @@ func TestBybitTrader_SymbolFormat(t *testing.T) {
 	}
 }
 
-// TestBybitTrader_FormatQuantity Test quantity formatting
+// TestBybitTrader_FormatQuantity Test quantity formatting.
+// The per-symbol qtyStep is seeded into the trader's qtyStepCache so that no
+// request to the live Bybit instruments-info endpoint is made (hermetic).
 func TestBybitTrader_FormatQuantity(t *testing.T) {
 	trader := NewBybitTrader("test", "test")
+
+	// Seed qtyStepCache with per-symbol steps (mirrors Bybit linear lotSizeFilter.qtyStep)
+	trader.qtyStepCacheMutex.Lock()
+	trader.qtyStepCache["BTCUSDT"] = 0.001
+	trader.qtyStepCache["ETHUSDT"] = 0.01
+	trader.qtyStepCache["SOLUSDT"] = 0.1
+	trader.qtyStepCache["DOGEUSDT"] = 1
+	trader.qtyStepCacheMutex.Unlock()
 
 	tests := []struct {
 		name     string
@@ -186,24 +196,31 @@ func TestBybitTrader_FormatQuantity(t *testing.T) {
 		hasError bool
 	}{
 		{
-			name:     "BTC quantity formatting",
+			name:     "BTC quantity formatting (step 0.001)",
 			symbol:   "BTCUSDT",
 			quantity: 0.12345,
-			expected: "0.123", // Bybit defaults to 3 decimal places
+			expected: "0.123",
 			hasError: false,
 		},
 		{
-			name:     "ETH quantity formatting",
+			name:     "ETH quantity formatting (step 0.01)",
 			symbol:   "ETHUSDT",
 			quantity: 1.2345,
-			expected: "1.234",
+			expected: "1.23",
 			hasError: false,
 		},
 		{
-			name:     "Integer quantity",
+			name:     "Integer quantity (SOL step 0.1)",
 			symbol:   "SOLUSDT",
 			quantity: 10.0,
-			expected: "10.000",
+			expected: "10.0",
+			hasError: false,
+		},
+		{
+			name:     "Whole-unit step rounds down (DOGE step 1)",
+			symbol:   "DOGEUSDT",
+			quantity: 1234.9,
+			expected: "1234",
 			hasError: false,
 		},
 	}

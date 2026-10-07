@@ -85,3 +85,30 @@ func TestGetTrader_AfterRemove(t *testing.T) {
 		t.Error("getting removed trader should return error")
 	}
 }
+
+// TestNilTraderEntriesAreSkipped verifies that bulk operations over the trader
+// map tolerate nil entries (as stored by the tests above) instead of panicking.
+func TestNilTraderEntriesAreSkipped(t *testing.T) {
+	tm := NewTraderManager()
+	tm.traders["nil-trader"] = nil
+
+	tm.StartAll()
+	tm.StopAll()
+
+	cmp, err := tm.GetComparisonData()
+	if err != nil {
+		t.Fatalf("GetComparisonData returned error: %v", err)
+	}
+	if cmp["count"] != 0 {
+		t.Errorf("expected 0 comparable traders, got %v", cmp["count"])
+	}
+
+	if _, err := tm.GetCompetitionData(); err != nil {
+		t.Fatalf("GetCompetitionData returned error: %v", err)
+	}
+
+	tm.RemoveTrader("nil-trader")
+	if _, exists := tm.traders["nil-trader"]; exists {
+		t.Error("nil trader should be removed from map")
+	}
+}

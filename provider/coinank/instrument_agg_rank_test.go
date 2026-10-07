@@ -8,6 +8,7 @@ import (
 )
 
 func TestVisualScreener(t *testing.T) {
+	requireLiveTests(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.VisualScreener(context.TODO(), coinank_enum.Minute15)
 	if err != nil {
@@ -21,6 +22,7 @@ func TestVisualScreener(t *testing.T) {
 }
 
 func TestOiRank(t *testing.T) {
+	requireLiveTests(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.OiRank(context.TODO(), coinank_enum.OpenInterest, coinank_enum.Desc, 1, 10)
 	if err != nil {
@@ -37,6 +39,7 @@ func TestOiRank(t *testing.T) {
 }
 
 func TestLongShortRank(t *testing.T) {
+	requireLiveTests(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.LongShortRank(context.TODO(), coinank_enum.LongShortRatio, coinank_enum.Desc, 1, 10)
 	if err != nil {
@@ -53,6 +56,7 @@ func TestLongShortRank(t *testing.T) {
 }
 
 func TestLiquidationRank(t *testing.T) {
+	requireLiveTests(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.LiquidationRank(context.TODO(), coinank_enum.LiquidationH1, coinank_enum.Desc, 1, 10)
 	if err != nil {
@@ -69,6 +73,7 @@ func TestLiquidationRank(t *testing.T) {
 }
 
 func TestPriceRank(t *testing.T) {
+	requireLiveTests(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.PriceRank(context.TODO(), coinank_enum.Price, coinank_enum.Desc, 1, 10)
 	if err != nil {
@@ -85,6 +90,7 @@ func TestPriceRank(t *testing.T) {
 }
 
 func TestVolumeRank(t *testing.T) {
+	requireLiveTests(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.VolumeRank(context.TODO(), coinank_enum.Turnover24h, coinank_enum.Desc, 1, 10)
 	if err != nil {

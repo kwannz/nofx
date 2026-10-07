@@ -10,6 +10,7 @@ import (
 )
 
 func TestKlineWs(t *testing.T) {
+	requireLiveTests(t)
 	ctx := context.TODO()
 	ws, err := WsConn(ctx, true, true)
 	if err != nil {

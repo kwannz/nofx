@@ -7,6 +7,7 @@ import (
 )
 
 func TestBaseCoinSymbolsNoArgs(t *testing.T) {
+	requireLiveTests(t)
 	resp, err := BaseCoinSymbols(context.TODO(), "", "", "")
 	if err != nil {
 		t.Error(err)
@@ -19,6 +20,7 @@ func TestBaseCoinSymbolsNoArgs(t *testing.T) {
 }
 
 func TestBaseCoinSymbolsBTC(t *testing.T) {
+	requireLiveTests(t)
 	resp, err := BaseCoinSymbols(context.TODO(), "", "", "BTC")
 	if err != nil {
 		t.Error(err)
@@ -31,6 +33,7 @@ func TestBaseCoinSymbolsBTC(t *testing.T) {
 }
 
 func TestBaseCoinSymbolsBTCUSDT(t *testing.T) {
+	requireLiveTests(t)
 	resp, err := BaseCoinSymbols(context.TODO(), "", "BTCUSDT", "")
 	if err != nil {
 		t.Error(err)
