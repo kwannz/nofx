@@ -501,6 +501,13 @@ func (e *StrategyEngine) GetCandidateCoins() ([]CandidateCoin, error) {
 			return e.filterExcludedCoins(candidates), nil
 		}
 		coins, err := e.getOITopCoins(coinSource.OITopLimit)
+		if nofxos.IsUnavailable(err) {
+			// The NofxOS circuit breaker is open (rejected API key). Keep the pre-breaker
+			// behaviour: an empty candidate list, not an error, so the trading cycle still
+			// runs and the AI can keep managing open positions. The client already warned once.
+			logger.Debugf("NofxOS unavailable, no OI Top candidate coins: %v", err)
+			return e.filterExcludedCoins(nil), nil
+		}
 		if err != nil {
 			return nil, err
 		}

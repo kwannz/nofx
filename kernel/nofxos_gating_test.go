@@ -276,3 +276,60 @@ func TestEngineStillWarnsOnOtherNofxosErrors(t *testing.T) {
 		t.Fatalf("non-breaker errors must still be logged:\n%s", logs.String())
 	}
 }
+
+// Strategies whose coin source is "oi_top" must keep running while NofxOS is unavailable: the
+// candidate list is empty (the pre-breaker behaviour) but there is no error, so the trading
+// cycle still completes and the AI keeps managing open positions.
+func TestOITopCandidateCoinsSurviveUnavailableNofxos(t *testing.T) {
+	logs := captureLogs(t)
+	unavailable := fmt.Errorf("request failed: %w", &nofxos.UnavailableError{Reason: "key deprecated"})
+
+	t.Run("fake client returns ErrUnavailable", func(t *testing.T) {
+		e, fake := engineWithFake(t, "")
+		fake.fetchErr = unavailable
+		e.config.CoinSource.SourceType = "oi_top"
+		e.config.CoinSource.UseOITop = true
+		e.config.CoinSource.StaticCoins = []string{"BTCUSDT"}
+
+		coins, err := e.GetCandidateCoins()
+		if err != nil {
+			t.Fatalf("GetCandidateCoins must not fail while NofxOS is unavailable: %v", err)
+		}
+		if len(coins) != 0 {
+			t.Fatalf("want an empty candidate list (pre-breaker behaviour), got %+v", coins)
+		}
+		if calls := fake.callList(); !reflect.DeepEqual(calls, []string{"GetOITopPositions"}) {
+			t.Fatalf("calls = %v, want a single GetOITopPositions", calls)
+		}
+	})
+
+	t.Run("excluded coins filter still applies", func(t *testing.T) {
+		e, fake := engineWithFake(t, "")
+		fake.fetchErr = unavailable
+		e.config.CoinSource.SourceType = "oi_top"
+		e.config.CoinSource.UseOITop = true
+		e.config.CoinSource.ExcludedCoins = []string{"DOGEUSDT"}
+		if coins, err := e.GetCandidateCoins(); err != nil || len(coins) != 0 {
+			t.Fatalf("GetCandidateCoins = %+v, %v; want empty, nil", coins, err)
+		}
+	})
+
+	// "Unavailable" is a debug-level event for callers.
+	for _, noisy := range []string{"Failed", "ERROR"} {
+		if bytes.Contains(logs.Bytes(), []byte(noisy)) {
+			t.Errorf("unexpected %q in logs while NofxOS is unavailable:\n%s", noisy, logs.String())
+		}
+	}
+}
+
+// Only the breaker error is swallowed for "oi_top"; genuine failures still surface.
+func TestOITopCandidateCoinsStillFailOnOtherErrors(t *testing.T) {
+	e, fake := engineWithFake(t, "")
+	fake.fetchErr = errors.New("boom")
+	e.config.CoinSource.SourceType = "oi_top"
+	e.config.CoinSource.UseOITop = true
+
+	if _, err := e.GetCandidateCoins(); err == nil {
+		t.Fatal("a non-breaker NofxOS error must still be returned for oi_top")
+	}
+}
