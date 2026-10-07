@@ -1144,6 +1144,17 @@ export const translations = {
       pnl: 'P&L',
       duration: 'Duration',
       closedAt: 'Closed At',
+      closeReason: 'Close Reason',
+      closeReasons: {
+        ai: 'AI',
+        manual: 'Manual',
+        stop_loss: 'Stop Loss',
+        take_profit: 'Take Profit',
+        liquidation: 'Liquidation',
+        drawdown: 'Drawdown',
+        sync: 'Synced',
+        paper_state_lost: 'Paper State Lost',
+      },
     },
 
     // Debate Arena Page
@@ -2296,6 +2307,17 @@ export const translations = {
       pnl: '盈亏',
       duration: '持仓时长',
       closedAt: '平仓时间',
+      closeReason: '平仓原因',
+      closeReasons: {
+        ai: 'AI 决策',
+        manual: '手动平仓',
+        stop_loss: '止损',
+        take_profit: '止盈',
+        liquidation: '强平',
+        drawdown: '回撤止盈',
+        sync: '同步',
+        paper_state_lost: '模拟盘状态丢失',
+      },
     },
 
     // Debate Arena Page

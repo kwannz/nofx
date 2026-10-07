@@ -8,6 +8,29 @@ import (
 	"time"
 )
 
+// close_reason vocabulary stored in trader_positions.close_reason. stop_loss, take_profit,
+// liquidation and manual match the CloseType vocabulary of trader.ClosedPnLRecord.
+const (
+	// CloseReasonSync is the default for closes imported from exchange trade history, where the
+	// trigger of the close is not known (exchange order syncs).
+	CloseReasonSync = "sync"
+	// CloseReasonAI is a close ordered by the AI decision cycle.
+	CloseReasonAI = "ai"
+	// CloseReasonManual is a close the user triggered (one-click close API).
+	CloseReasonManual = "manual"
+	// CloseReasonStopLoss is a stop loss trigger.
+	CloseReasonStopLoss = "stop_loss"
+	// CloseReasonTakeProfit is a take profit trigger.
+	CloseReasonTakeProfit = "take_profit"
+	// CloseReasonLiquidation is a forced liquidation.
+	CloseReasonLiquidation = "liquidation"
+	// CloseReasonDrawdown is the drawdown monitor's emergency close.
+	CloseReasonDrawdown = "drawdown"
+	// CloseReasonPaperStateLost is a paper position closed because the paper account no longer
+	// held it (see AutoTrader.reconcilePaperPositions).
+	CloseReasonPaperStateLost = "paper_state_lost"
+)
+
 // PositionBuilder handles position creation and updates with support for:
 // - Position averaging (merging multiple opens)
 // - Partial closes (reducing quantity)
@@ -24,7 +47,9 @@ func NewPositionBuilder(positionStore *PositionStore) *PositionBuilder {
 	}
 }
 
-// ProcessTrade processes a single trade and updates position accordingly
+// ProcessTrade processes a single trade and updates position accordingly.
+// Closes are recorded with close_reason "sync" (exchange order syncs); use
+// ProcessTradeWithReason when the cause of the close is known.
 // tradeTimeMs is Unix milliseconds UTC
 func (pb *PositionBuilder) ProcessTrade(
 	traderID, exchangeID, exchangeType, symbol, side, action string,
@@ -32,10 +57,32 @@ func (pb *PositionBuilder) ProcessTrade(
 	tradeTimeMs int64,
 	orderID string,
 ) error {
+	return pb.ProcessTradeWithReason(
+		traderID, exchangeID, exchangeType, symbol, side, action,
+		quantity, price, fee, realizedPnL, tradeTimeMs, orderID, CloseReasonSync,
+	)
+}
+
+// ProcessTradeWithReason is ProcessTrade with an explicit close reason (one of the CloseReason*
+// constants). The reason is stored in close_reason when the trade closes a position fully. A
+// partial close only reduces the quantity and keeps the position OPEN, so the reason of a
+// position closed in several steps is the one of its final close. An empty reason falls back to
+// CloseReasonSync; the reason is ignored for open trades.
+// tradeTimeMs is Unix milliseconds UTC
+func (pb *PositionBuilder) ProcessTradeWithReason(
+	traderID, exchangeID, exchangeType, symbol, side, action string,
+	quantity, price, fee, realizedPnL float64,
+	tradeTimeMs int64,
+	orderID string,
+	closeReason string,
+) error {
 	if strings.HasPrefix(action, "open_") {
 		return pb.handleOpen(traderID, exchangeID, exchangeType, symbol, side, quantity, price, fee, tradeTimeMs, orderID)
 	} else if strings.HasPrefix(action, "close_") {
-		return pb.handleClose(traderID, exchangeID, exchangeType, symbol, side, quantity, price, fee, realizedPnL, tradeTimeMs, orderID)
+		if closeReason == "" {
+			closeReason = CloseReasonSync
+		}
+		return pb.handleClose(traderID, exchangeID, exchangeType, symbol, side, quantity, price, fee, realizedPnL, tradeTimeMs, orderID, closeReason)
 	}
 	return nil
 }
@@ -99,6 +146,7 @@ func (pb *PositionBuilder) handleClose(
 	quantity, price, fee, realizedPnL float64,
 	tradeTimeMs int64,
 	orderID string,
+	closeReason string,
 ) error {
 	// Get OPEN position
 	position, err := pb.positionStore.GetOpenPositionBySymbol(traderID, symbol, side)
@@ -168,7 +216,7 @@ func (pb *PositionBuilder) handleClose(
 			tradeTimeMs,
 			totalPnL,
 			totalFee,
-			"sync",
+			closeReason,
 		)
 	}
 }
