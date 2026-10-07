@@ -27,15 +27,25 @@ func newYorkLocation() *time.Location {
 
 func init() { newYorkLocation() }
 
+// US cash-market regular session, minutes after midnight ET.
+const (
+	usRegularOpenMinute  = 9*60 + 30
+	usRegularCloseMinute = 16 * 60
+)
+
 // MarketSession reports the trading session state of an asset class at time t.
 //
 //	open         - whether Bitget's perpetual for this asset class is tradable
 //	regularHours - whether the underlying US cash market is in its regular session
-//	               (Mon-Fri 09:30-16:00 ET); only meaningful for equities
+//	               (Mon-Fri 09:30-16:00 ET, never on an NYSE holiday, until 13:00 ET
+//	               on an NYSE early-close day); only meaningful for equities
 //	note         - short human-readable description (also usable in prompts)
 //
 // Bitget TradFi perps trade 5x24: Monday 00:00 ET to Saturday 00:00 ET.
-// US market holidays are NOT modelled (mentioned in the note).
+// NYSE holidays and early closes (2025-2027, see USMarketHoliday) do NOT close
+// the perp: open stays true and only regularHours/note reflect the closed or
+// shortened cash session. Real halts are handled by the contract SymbolStatus.
+// Outside the modelled years the note says holidays are not modelled.
 // Crypto is always open.
 func MarketSession(assetClass string, t time.Time) (open bool, regularHours bool, note string) {
 	switch strings.ToLower(assetClass) {
@@ -49,14 +59,47 @@ func MarketSession(assetClass string, t time.Time) (open bool, regularHours bool
 		return false, false, fmt.Sprintf("closed for the weekend (Sat 00:00 - Mon 00:00 ET); now %s ET. Opening trades is not allowed", et.Format("Mon 15:04"))
 	}
 	minutes := et.Hour()*60 + et.Minute()
-	regular := minutes >= 9*60+30 && minutes < 16*60
+
+	holiday, early, special := USMarketHoliday(et)
+	closeMinute := usRegularCloseMinute
+	switch {
+	case special && early:
+		closeMinute = usEarlyCloseMinute
+	case special:
+		closeMinute = 0 // cash market closed all day
+	}
+	regular := minutes >= usRegularOpenMinute && minutes < closeMinute
+
+	suffix := ""
+	if !USMarketCalendarCovers(et) {
+		suffix = fmt.Sprintf("; US holidays not modelled for %d (calendar covers %d-%d)",
+			et.Year(), usMarketCalendarFirstYear, usMarketCalendarLastYear)
+	}
+	const thinLiquidity = "perp liquidity may be thin and price may gap at reopen"
+	earlyNote := fmt.Sprintf("US early close 13:00 ET (%s)", holiday)
+
 	switch strings.ToLower(assetClass) {
 	case "equity":
-		if regular {
-			return true, true, "open, US regular hours (09:30-16:00 ET); US holidays not modelled"
+		switch {
+		case special && !early:
+			return true, false, fmt.Sprintf("open 5x24, US cash market closed (%s); %s", holiday, thinLiquidity)
+		case special && regular:
+			return true, true, fmt.Sprintf("open, US regular hours (09:30-13:00 ET); %s", earlyNote)
+		case special && minutes >= usEarlyCloseMinute:
+			return true, false, fmt.Sprintf("open, US cash market closed after %s; %s", earlyNote, thinLiquidity)
+		case special:
+			return true, false, fmt.Sprintf("open, outside US regular hours (extended/overnight session, thinner liquidity and wider spreads); %s", earlyNote)
+		case regular:
+			return true, true, "open, US regular hours (09:30-16:00 ET)" + suffix
 		}
-		return true, false, "open, outside US regular hours (extended/overnight session, thinner liquidity and wider spreads); US holidays not modelled"
+		return true, false, "open, outside US regular hours (extended/overnight session, thinner liquidity and wider spreads)" + suffix
 	default: // commodity, fx
-		return true, regular, "open 5x24 (Mon 00:00 - Sat 00:00 ET); holidays/maintenance not modelled"
+		switch {
+		case special && !early:
+			return true, false, fmt.Sprintf("open 5x24, US market holiday (%s): US cash market closed; %s", holiday, thinLiquidity)
+		case special:
+			return true, regular, fmt.Sprintf("open 5x24 (Mon 00:00 - Sat 00:00 ET); %s", earlyNote)
+		}
+		return true, regular, "open 5x24 (Mon 00:00 - Sat 00:00 ET); maintenance not modelled" + suffix
 	}
 }
