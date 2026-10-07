@@ -12,13 +12,13 @@ import (
 )
 
 var testContracts = map[string]bitget.Contract{
-	"BTCUSDT":  {Symbol: "BTCUSDT", BaseCoin: "BTC", MaxLever: 125, SymbolStatus: "normal"},
-	"SOLUSDT":  {Symbol: "SOLUSDT", BaseCoin: "SOL", MaxLever: 75, SymbolStatus: "normal"},
-	"NVDAUSDT": {Symbol: "NVDAUSDT", BaseCoin: "NVDA", MaxLever: 100, SymbolStatus: "normal", IsRwa: true},
-	"LOWUSDT":  {Symbol: "LOWUSDT", BaseCoin: "LOW", MaxLever: 3, SymbolStatus: "normal", IsRwa: true},
-	"XAUUSDT":  {Symbol: "XAUUSDT", BaseCoin: "XAU", MaxLever: 100, SymbolStatus: "normal", IsRwa: true},
+	"BTCUSDT":    {Symbol: "BTCUSDT", BaseCoin: "BTC", MaxLever: 125, SymbolStatus: "normal"},
+	"SOLUSDT":    {Symbol: "SOLUSDT", BaseCoin: "SOL", MaxLever: 75, SymbolStatus: "normal"},
+	"NVDAUSDT":   {Symbol: "NVDAUSDT", BaseCoin: "NVDA", MaxLever: 100, SymbolStatus: "normal", IsRwa: true},
+	"LOWUSDT":    {Symbol: "LOWUSDT", BaseCoin: "LOW", MaxLever: 3, SymbolStatus: "normal", IsRwa: true},
+	"XAUUSDT":    {Symbol: "XAUUSDT", BaseCoin: "XAU", MaxLever: 100, SymbolStatus: "normal", IsRwa: true},
 	"EURUSDUSDT": {Symbol: "EURUSDUSDT", BaseCoin: "EURUSD", MaxLever: 100, SymbolStatus: "normal", IsRwa: true},
-	"HALTUSDT": {Symbol: "HALTUSDT", BaseCoin: "HALT", MaxLever: 10, SymbolStatus: "maintain", IsRwa: true},
+	"HALTUSDT":   {Symbol: "HALTUSDT", BaseCoin: "HALT", MaxLever: 10, SymbolStatus: "maintain", IsRwa: true},
 }
 
 // withEnv injects a fake clock and contract metadata.
@@ -57,13 +57,13 @@ func TestValidateDecisionLeverageByAssetClass(t *testing.T) {
 		lev     int
 		wantLev int
 	}{
-		{"BTCUSDT", 50, 5},   // btc/eth cap (btcEth=5)
-		{"SOLUSDT", 50, 4},   // altcoin cap (4)
-		{"NVDAUSDT", 50, 5},  // equity cap
-		{"XAUUSDT", 50, 10},  // commodity cap
+		{"BTCUSDT", 50, 5},     // btc/eth cap (btcEth=5)
+		{"SOLUSDT", 50, 4},     // altcoin cap (4)
+		{"NVDAUSDT", 50, 5},    // equity cap
+		{"XAUUSDT", 50, 10},    // commodity cap
 		{"EURUSDUSDT", 50, 10}, // fx uses commodity cap
-		{"NVDAUSDT", 3, 3},   // below cap untouched
-		{"LOWUSDT", 5, 3},    // contract maxLever 3 < equity cap 5
+		{"NVDAUSDT", 3, 3},     // below cap untouched
+		{"LOWUSDT", 5, 3},      // contract maxLever 3 < equity cap 5
 	}
 	for _, tt := range tests {
 		d := openDecision(tt.symbol, tt.lev)
@@ -187,5 +187,28 @@ func TestTradFiPromptLine(t *testing.T) {
 	}
 	if !e.isNonCrypto("NVDAUSDT") || e.isNonCrypto("BTCUSDT") {
 		t.Error("isNonCrypto misclassified")
+	}
+}
+
+func TestDropUntradableOpensKeepsOtherDecisions(t *testing.T) {
+	withEnv(t, et(2026, 1, 3, 12)) // Saturday: TradFi closed, crypto open
+
+	ds := []Decision{
+		*openDecision("NVDAUSDT", 3),
+		{Symbol: "XAUUSDT", Action: "close_long"},
+		*openDecision("BTCUSDT", 3),
+	}
+	got := dropUntradableOpens(ds, tradFiEnv())
+	if len(got) != 2 || got[0].Symbol != "XAUUSDT" || got[1].Symbol != "BTCUSDT" {
+		t.Fatalf("want closed-session open dropped and others kept, got %+v", got)
+	}
+	if err := validateDecisions(got, 10000, 5, 4, 5, 1, tradFiEnv()); err != nil {
+		t.Fatalf("remaining decisions should validate: %v", err)
+	}
+
+	// Legacy env: untouched.
+	legacy := []Decision{*openDecision("NVDAUSDT", 3)}
+	if out := dropUntradableOpens(legacy, nil); len(out) != 1 {
+		t.Fatalf("nil env must not drop decisions")
 	}
 }

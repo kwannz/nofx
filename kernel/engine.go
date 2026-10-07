@@ -1605,6 +1605,8 @@ func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthL
 		}, fmt.Errorf("failed to extract decisions: %w", err)
 	}
 
+	decisions = dropUntradableOpens(decisions, env)
+
 	if err := validateDecisions(decisions, accountEquity, btcEthLeverage, altcoinLeverage, btcEthPosRatio, altcoinPosRatio, env); err != nil {
 		return &FullDecision{
 			CoTTrace:  cotTrace,
