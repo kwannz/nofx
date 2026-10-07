@@ -855,7 +855,9 @@ func Format(data *Data) string {
 			oiLatestStr, oiAverageStr))
 	}
 
-	sb.WriteString(fmt.Sprintf("Funding Rate: %.2e\n\n", data.FundingRate))
+	if !data.FundingRateUnavailable {
+		sb.WriteString(fmt.Sprintf("Funding Rate: %.2e\n\n", data.FundingRate))
+	}
 
 	if data.IntradaySeries != nil {
 		sb.WriteString("Intraday series (3‑minute intervals, oldest → latest):\n\n")

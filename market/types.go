@@ -13,6 +13,9 @@ type Data struct {
 	CurrentRSI7       float64
 	OpenInterest      *OIData
 	FundingRate       float64
+	// FundingRateUnavailable is true when the funding rate could not be fetched
+	// (so formatters omit the line instead of printing a misleading 0).
+	FundingRateUnavailable bool
 	IntradaySeries    *IntradayData
 	LongerTermContext *LongerTermData
 	// Multi-timeframe data (new)

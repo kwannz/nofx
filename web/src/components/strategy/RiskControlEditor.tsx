@@ -25,6 +25,10 @@ export function RiskControlEditor({
       btcEthLeverageDesc: { zh: '交易所开仓使用的杠杆倍数', en: 'Exchange leverage for opening positions' },
       altcoinLeverage: { zh: '山寨币交易杠杆', en: 'Altcoin Trading Leverage' },
       altcoinLeverageDesc: { zh: '交易所开仓使用的杠杆倍数', en: 'Exchange leverage for opening positions' },
+      equityLeverage: { zh: '美股/ETF 交易杠杆', en: 'US Equity/ETF Trading Leverage' },
+      equityLeverageDesc: { zh: 'Bitget 美股永续等 TradFi 标的开仓杠杆上限（5×24 交易时段）', en: 'Leverage cap for equity/ETF perps such as Bitget NVDAUSDT (5x24 session)' },
+      commodityLeverage: { zh: '商品/外汇 交易杠杆', en: 'Commodity/FX Trading Leverage' },
+      commodityLeverageDesc: { zh: '黄金、原油、外汇等 TradFi 标的开仓杠杆上限', en: 'Leverage cap for commodity/FX perps such as XAUUSDT' },
       // Position value ratio (risk control) - CODE ENFORCED
       positionValueRatio: { zh: '仓位价值比例（代码强制）', en: 'Position Value Ratio (CODE ENFORCED)' },
       positionValueRatioDesc: { zh: '单仓位名义价值 / 账户净值，由代码强制执行', en: 'Position notional value / equity, enforced by code' },
@@ -161,6 +165,68 @@ export function RiskControlEditor({
                 style={{ color: '#F0B90B' }}
               >
                 {config.altcoin_max_leverage ?? 5}x
+              </span>
+            </div>
+          </div>
+
+          <div
+            className="p-4 rounded-lg"
+            style={{ background: '#0B0E11', border: '1px solid #2B3139' }}
+          >
+            <label className="block text-sm mb-1" style={{ color: '#EAECEF' }}>
+              {t('equityLeverage')}
+            </label>
+            <p className="text-xs mb-2" style={{ color: '#848E9C' }}>
+              {t('equityLeverageDesc')}
+            </p>
+            <div className="flex items-center gap-2">
+              <input
+                type="range"
+                value={config.equity_max_leverage ?? 5}
+                onChange={(e) =>
+                  updateField('equity_max_leverage', parseInt(e.target.value))
+                }
+                disabled={disabled}
+                min={1}
+                max={20}
+                className="flex-1 accent-yellow-500"
+              />
+              <span
+                className="w-12 text-center font-mono"
+                style={{ color: '#F0B90B' }}
+              >
+                {config.equity_max_leverage ?? 5}x
+              </span>
+            </div>
+          </div>
+
+          <div
+            className="p-4 rounded-lg"
+            style={{ background: '#0B0E11', border: '1px solid #2B3139' }}
+          >
+            <label className="block text-sm mb-1" style={{ color: '#EAECEF' }}>
+              {t('commodityLeverage')}
+            </label>
+            <p className="text-xs mb-2" style={{ color: '#848E9C' }}>
+              {t('commodityLeverageDesc')}
+            </p>
+            <div className="flex items-center gap-2">
+              <input
+                type="range"
+                value={config.commodity_max_leverage ?? 10}
+                onChange={(e) =>
+                  updateField('commodity_max_leverage', parseInt(e.target.value))
+                }
+                disabled={disabled}
+                min={1}
+                max={20}
+                className="flex-1 accent-yellow-500"
+              />
+              <span
+                className="w-12 text-center font-mono"
+                style={{ color: '#F0B90B' }}
+              >
+                {config.commodity_max_leverage ?? 10}x
               </span>
             </div>
           </div>

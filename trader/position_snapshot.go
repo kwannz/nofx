@@ -46,7 +46,7 @@ func CreatePositionSnapshot(traderID, exchangeID, exchangeType string, trader Tr
 	for _, posMap := range positions {
 		// Parse position data
 		rawSymbol, _ := posMap["symbol"].(string)
-		symbol := market.Normalize(rawSymbol)
+		symbol := market.NormalizeForSource(rawSymbol, marketSourceForExchange(exchangeType))
 		sideStr, _ := posMap["side"].(string)
 		positionAmt, _ := posMap["positionAmt"].(float64)
 		entryPrice, _ := posMap["entryPrice"].(float64)

@@ -193,6 +193,7 @@ type OIDeltaData struct {
 type StrategyEngine struct {
 	config       *store.StrategyConfig
 	nofxosClient *nofxos.Client
+	marketSource market.Source // where market data comes from (default: legacy routing)
 }
 
 // NewStrategyEngine creates strategy execution engine
@@ -301,6 +302,7 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 		riskConfig.AltcoinMaxLeverage,
 		riskConfig.BTCETHMaxPositionValueRatio,
 		riskConfig.AltcoinMaxPositionValueRatio,
+		engine.validationEnv(),
 	)
 
 	if decision != nil {
@@ -353,7 +355,7 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 
 	// 1. First fetch data for position coins (must fetch)
 	for _, pos := range ctx.Positions {
-		data, err := market.GetWithTimeframes(pos.Symbol, timeframes, primaryTimeframe, klineCount)
+		data, err := market.GetWithTimeframesFromSource(pos.Symbol, timeframes, primaryTimeframe, klineCount, engine.marketSource)
 		if err != nil {
 			logger.Infof("⚠️  Failed to fetch market data for position %s: %v", pos.Symbol, err)
 			continue
@@ -374,7 +376,7 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 			continue
 		}
 
-		data, err := market.GetWithTimeframes(coin.Symbol, timeframes, primaryTimeframe, klineCount)
+		data, err := market.GetWithTimeframesFromSource(coin.Symbol, timeframes, primaryTimeframe, klineCount, engine.marketSource)
 		if err != nil {
 			logger.Infof("⚠️  Failed to fetch market data for %s: %v", coin.Symbol, err)
 			continue
@@ -383,6 +385,11 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 		// Liquidity filter (skip for xyz dex assets - they don't have OI data from Binance)
 		isExistingPosition := positionSymbols[coin.Symbol]
 		isXyzAsset := market.IsXyzDexAsset(coin.Symbol)
+		if engine.marketSource == market.SourceBitget {
+			// Bitget: OI-value liquidity filter only applies to crypto; TradFi (RWA)
+			// perps have unrelated/absent OI figures and must not be dropped.
+			isXyzAsset = engine.isNonCrypto(coin.Symbol)
+		}
 		if !isExistingPosition && !isXyzAsset && data.OpenInterest != nil && data.CurrentPrice > 0 {
 			oiValue := data.OpenInterest.Latest * data.CurrentPrice
 			oiValueInMillions := oiValue / 1_000_000
@@ -414,7 +421,7 @@ func (e *StrategyEngine) GetCandidateCoins() ([]CandidateCoin, error) {
 	switch coinSource.SourceType {
 	case "static":
 		for _, symbol := range coinSource.StaticCoins {
-			symbol = market.Normalize(symbol)
+			symbol = e.normalize(symbol)
 			candidates = append(candidates, CandidateCoin{
 				Symbol:  symbol,
 				Sources: []string{"static"},
@@ -428,7 +435,7 @@ func (e *StrategyEngine) GetCandidateCoins() ([]CandidateCoin, error) {
 		if !coinSource.UseAI500 {
 			logger.Infof("⚠️  source_type is 'ai500' but use_ai500 is false, falling back to static coins")
 			for _, symbol := range coinSource.StaticCoins {
-				symbol = market.Normalize(symbol)
+				symbol = e.normalize(symbol)
 				candidates = append(candidates, CandidateCoin{
 					Symbol:  symbol,
 					Sources: []string{"static"},
@@ -447,7 +454,7 @@ func (e *StrategyEngine) GetCandidateCoins() ([]CandidateCoin, error) {
 		if !coinSource.UseOITop {
 			logger.Infof("⚠️  source_type is 'oi_top' but use_oi_top is false, falling back to static coins")
 			for _, symbol := range coinSource.StaticCoins {
-				symbol = market.Normalize(symbol)
+				symbol = e.normalize(symbol)
 				candidates = append(candidates, CandidateCoin{
 					Symbol:  symbol,
 					Sources: []string{"static"},
@@ -485,7 +492,7 @@ func (e *StrategyEngine) GetCandidateCoins() ([]CandidateCoin, error) {
 		}
 
 		for _, symbol := range coinSource.StaticCoins {
-			symbol = market.Normalize(symbol)
+			symbol = e.normalize(symbol)
 			if _, exists := symbolSources[symbol]; !exists {
 				symbolSources[symbol] = []string{"static"}
 			} else {
@@ -515,7 +522,7 @@ func (e *StrategyEngine) filterExcludedCoins(candidates []CandidateCoin) []Candi
 	// Build excluded set for O(1) lookup
 	excluded := make(map[string]bool)
 	for _, coin := range e.config.CoinSource.ExcludedCoins {
-		normalized := market.Normalize(coin)
+		normalized := e.normalize(coin)
 		excluded[normalized] = true
 	}
 
@@ -567,7 +574,7 @@ func (e *StrategyEngine) getOITopCoins(limit int) ([]CandidateCoin, error) {
 		if i >= limit {
 			break
 		}
-		symbol := market.Normalize(pos.Symbol)
+		symbol := e.normalize(pos.Symbol)
 		candidates = append(candidates, CandidateCoin{
 			Symbol:  symbol,
 			Sources: []string{"oi_top"},
@@ -582,7 +589,7 @@ func (e *StrategyEngine) getOITopCoins(limit int) ([]CandidateCoin, error) {
 
 // FetchMarketData fetches market data based on strategy configuration
 func (e *StrategyEngine) FetchMarketData(symbol string) (*market.Data, error) {
-	return market.Get(symbol)
+	return market.GetWithSource(symbol, e.marketSource)
 }
 
 // FetchExternalData fetches external data sources
@@ -976,6 +983,9 @@ func (e *StrategyEngine) BuildSystemPrompt(accountEquity float64, variant string
 	sb.WriteString("  {\"symbol\": \"ETHUSDT\", \"action\": \"close_long\"}\n")
 	sb.WriteString("]\n```\n")
 	sb.WriteString("</decision>\n\n")
+	if e.marketSource == market.SourceBitget {
+		sb.WriteString(tradFiSystemNote(riskControl))
+	}
 	sb.WriteString("## Field Description\n\n")
 	sb.WriteString("- `action`: open_long | open_short | close_long | close_short | hold | wait\n")
 	sb.WriteString(fmt.Sprintf("- `confidence`: 0-100 (opening recommended ≥ %d)\n", riskControl.MinConfidence))
@@ -1172,6 +1182,7 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 		sb.WriteString("## Current Positions\n")
 		for i, pos := range ctx.Positions {
 			sb.WriteString(e.formatPositionInfo(i+1, pos, ctx))
+			sb.WriteString(e.tradFiPromptLine(pos.Symbol))
 		}
 	} else {
 		sb.WriteString("Current Positions: None\n\n")
@@ -1181,7 +1192,7 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 	positionSymbols := make(map[string]bool)
 	for _, pos := range ctx.Positions {
 		// Normalize symbol to handle both "ETH" and "ETHUSDT" formats
-		normalizedSymbol := market.Normalize(pos.Symbol)
+		normalizedSymbol := e.normalize(pos.Symbol)
 		positionSymbols[normalizedSymbol] = true
 	}
 
@@ -1189,7 +1200,7 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 	displayedCount := 0
 	for _, coin := range ctx.CandidateCoins {
 		// Skip if this coin is already a position (data already shown in positions section)
-		normalizedCoinSymbol := market.Normalize(coin.Symbol)
+		normalizedCoinSymbol := e.normalize(coin.Symbol)
 		if positionSymbols[normalizedCoinSymbol] {
 			continue
 		}
@@ -1202,6 +1213,7 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 
 		sourceTags := e.formatCoinSourceTag(coin.Sources)
 		sb.WriteString(fmt.Sprintf("### %d. %s%s\n\n", displayedCount, coin.Symbol, sourceTags))
+		sb.WriteString(e.tradFiPromptLine(coin.Symbol))
 		sb.WriteString(e.formatMarketData(marketData))
 
 		if ctx.QuantDataMap != nil {
@@ -1330,7 +1342,7 @@ func (e *StrategyEngine) formatMarketData(data *market.Data) string {
 				data.OpenInterest.Latest, data.OpenInterest.Average))
 		}
 
-		if indicators.EnableFundingRate {
+		if indicators.EnableFundingRate && !data.FundingRateUnavailable {
 			sb.WriteString(fmt.Sprintf("Funding Rate: %.2e\n\n", data.FundingRate))
 		}
 	}
@@ -1582,7 +1594,7 @@ func formatFloatSlice(values []float64) string {
 // AI Response Parsing
 // ============================================================================
 
-func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64) (*FullDecision, error) {
+func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64, env *validationEnv) (*FullDecision, error) {
 	cotTrace := extractCoTTrace(aiResponse)
 
 	decisions, err := extractDecisions(aiResponse)
@@ -1593,7 +1605,7 @@ func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthL
 		}, fmt.Errorf("failed to extract decisions: %w", err)
 	}
 
-	if err := validateDecisions(decisions, accountEquity, btcEthLeverage, altcoinLeverage, btcEthPosRatio, altcoinPosRatio); err != nil {
+	if err := validateDecisions(decisions, accountEquity, btcEthLeverage, altcoinLeverage, btcEthPosRatio, altcoinPosRatio, env); err != nil {
 		return &FullDecision{
 			CoTTrace:  cotTrace,
 			Decisions: decisions,
@@ -1759,9 +1771,10 @@ func compactArrayOpen(s string) string {
 // Decision Validation
 // ============================================================================
 
-func validateDecisions(decisions []Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64) error {
-	for i, decision := range decisions {
-		if err := validateDecision(&decision, accountEquity, btcEthLeverage, altcoinLeverage, btcEthPosRatio, altcoinPosRatio); err != nil {
+func validateDecisions(decisions []Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64, env *validationEnv) error {
+	for i := range decisions {
+		// Validate in place so leverage clamping is reflected in the returned decisions.
+		if err := validateDecisionEnv(&decisions[i], accountEquity, btcEthLeverage, altcoinLeverage, btcEthPosRatio, altcoinPosRatio, env); err != nil {
 			return fmt.Errorf("decision #%d validation failed: %w", i+1, err)
 		}
 	}
@@ -1769,6 +1782,12 @@ func validateDecisions(decisions []Decision, accountEquity float64, btcEthLevera
 }
 
 func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64) error {
+	return validateDecisionEnv(d, accountEquity, btcEthLeverage, altcoinLeverage, btcEthPosRatio, altcoinPosRatio, nil)
+}
+
+// validateDecisionEnv validates a decision. env (nil = legacy) enables Bitget
+// TradFi rules: per-asset-class leverage caps, contract maxLever and session checks.
+func validateDecisionEnv(d *Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64, env *validationEnv) error {
 	validActions := map[string]bool{
 		"open_long":   true,
 		"open_short":  true,
@@ -1790,6 +1809,20 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 			maxLeverage = btcEthLeverage
 			posRatio = btcEthPosRatio
 			maxPositionValue = accountEquity * posRatio
+		}
+
+		if env != nil && env.Bitget {
+			info, err := resolveSymbol(d.Symbol, nowFunc())
+			if err != nil {
+				return fmt.Errorf("cannot open %s: contract metadata unavailable: %w", d.Symbol, err)
+			}
+			if !info.Open {
+				return fmt.Errorf("cannot open %s: market closed (%s, %s); closing positions is still allowed", d.Symbol, info.AssetClass, info.Note)
+			}
+			maxLeverage = env.leverageCapFor(info.AssetClass, d.Symbol, btcEthLeverage, altcoinLeverage)
+			if info.MaxLever > 0 && (maxLeverage <= 0 || info.MaxLever < maxLeverage) {
+				maxLeverage = info.MaxLever
+			}
 		}
 
 		if d.Leverage <= 0 {

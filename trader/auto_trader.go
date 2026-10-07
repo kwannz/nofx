@@ -312,6 +312,7 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 		return nil, fmt.Errorf("[%s] strategy not configured", config.Name)
 	}
 	strategyEngine := kernel.NewStrategyEngine(config.StrategyConfig)
+	strategyEngine.SetMarketSource(marketSourceForExchange(config.Exchange))
 	logger.Infof("✓ [%s] Using strategy engine (strategy configuration loaded)", config.Name)
 
 	return &AutoTrader{
@@ -1022,7 +1023,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *kernel.Decision, actio
 	}
 
 	// Get current price
-	marketData, err := market.Get(decision.Symbol)
+	marketData, err := market.GetWithSource(decision.Symbol, at.marketSource())
 	if err != nil {
 		return err
 	}
@@ -1139,7 +1140,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *kernel.Decision, acti
 	}
 
 	// Get current price
-	marketData, err := market.Get(decision.Symbol)
+	marketData, err := market.GetWithSource(decision.Symbol, at.marketSource())
 	if err != nil {
 		return err
 	}
@@ -1238,14 +1239,14 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *kernel.Decision, acti
 	logger.Infof("  🔄 Close long: %s", decision.Symbol)
 
 	// Get current price
-	marketData, err := market.Get(decision.Symbol)
+	marketData, err := market.GetWithSource(decision.Symbol, at.marketSource())
 	if err != nil {
 		return err
 	}
 	actionRecord.Price = marketData.CurrentPrice
 
 	// Normalize symbol for database lookup
-	normalizedSymbol := market.Normalize(decision.Symbol)
+	normalizedSymbol := at.normalizeSymbol(decision.Symbol)
 
 	// Get entry price and quantity - prioritize local database for accurate quantity
 	var entryPrice float64
@@ -1302,14 +1303,14 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *kernel.Decision, act
 	logger.Infof("  🔄 Close short: %s", decision.Symbol)
 
 	// Get current price
-	marketData, err := market.Get(decision.Symbol)
+	marketData, err := market.GetWithSource(decision.Symbol, at.marketSource())
 	if err != nil {
 		return err
 	}
 	actionRecord.Price = marketData.CurrentPrice
 
 	// Normalize symbol for database lookup
-	normalizedSymbol := market.Normalize(decision.Symbol)
+	normalizedSymbol := at.normalizeSymbol(decision.Symbol)
 
 	// Get entry price and quantity - prioritize local database for accurate quantity
 	var entryPrice float64
@@ -1938,7 +1939,7 @@ func (at *AutoTrader) recordAndConfirmOrder(orderResult map[string]interface{}, 
 	}
 
 	// Normalize symbol for position record consistency
-	normalizedSymbolForPosition := market.Normalize(symbol)
+	normalizedSymbolForPosition := at.normalizeSymbol(symbol)
 
 	logger.Infof("  📝 Recording position (ID: %s, action: %s, price: %.6f, qty: %.6f, fee: %.4f)",
 		orderID, action, actualPrice, actualQty, fee)
@@ -2030,7 +2031,7 @@ func (at *AutoTrader) createOrderRecord(orderID, symbol, action, positionSide st
 	reduceOnly := (action == "close_long" || action == "close_short")
 
 	// Normalize symbol for consistency
-	normalizedSymbol := market.Normalize(symbol)
+	normalizedSymbol := at.normalizeSymbol(symbol)
 
 	return &store.TraderOrder{
 		TraderID:        at.id,
@@ -2077,7 +2078,7 @@ func (at *AutoTrader) recordOrderFill(orderRecordID int64, exchangeOrderID, symb
 	tradeID := fmt.Sprintf("%s-%d", exchangeOrderID, time.Now().UnixNano())
 
 	// Normalize symbol for consistency
-	normalizedSymbol := market.Normalize(symbol)
+	normalizedSymbol := at.normalizeSymbol(symbol)
 
 	fill := &store.TraderFill{
 		TraderID:         at.id,
@@ -2224,3 +2225,25 @@ func (at *AutoTrader) GetOpenOrders(symbol string) ([]OpenOrder, error) {
 	return at.trader.GetOpenOrders(symbol)
 }
 
+
+// marketSourceForExchange maps an exchange type to its market data source.
+// Bitget (live/demo and local paper) uses Bitget public data so TradFi symbols
+// such as NVDAUSDT / XAUUSDT resolve to the same venue that executes the orders.
+func marketSourceForExchange(exchange string) market.Source {
+	switch exchange {
+	case "bitget", "bitget_paper":
+		return market.SourceBitget
+	}
+	return market.SourceDefault
+}
+
+// marketSource returns the market data source for this trader's exchange.
+func (at *AutoTrader) marketSource() market.Source {
+	return marketSourceForExchange(at.exchange)
+}
+
+// normalizeSymbol normalizes a symbol consistently with the market data source
+// (Bitget keeps NVDAUSDT as-is instead of mapping to xyz:NVDA).
+func (at *AutoTrader) normalizeSymbol(symbol string) string {
+	return market.NormalizeForSource(symbol, at.marketSource())
+}

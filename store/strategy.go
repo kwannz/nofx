@@ -165,6 +165,12 @@ type RiskControlConfig struct {
 	BTCETHMaxLeverage int `json:"btc_eth_max_leverage"`
 	// Altcoin exchange leverage for opening positions (AI guided)
 	AltcoinMaxLeverage int `json:"altcoin_max_leverage"`
+	// US equity / ETF perps (TradFi, e.g. Bitget NVDAUSDT) max leverage (default 5).
+	// Zero (older configs) falls back to AltcoinMaxLeverage.
+	EquityMaxLeverage int `json:"equity_max_leverage"`
+	// Commodity / FX perps (e.g. XAUUSDT, EURUSDUSDT) max leverage (default 10).
+	// Zero (older configs) falls back to AltcoinMaxLeverage.
+	CommodityMaxLeverage int `json:"commodity_max_leverage"`
 
 	// BTC/ETH single position max value = equity × this ratio (CODE ENFORCED, default: 5)
 	BTCETHMaxPositionValueRatio float64 `json:"btc_eth_max_position_value_ratio"`
@@ -180,6 +186,24 @@ type RiskControlConfig struct {
 	MinRiskRewardRatio float64 `json:"min_risk_reward_ratio"`
 	// Min AI confidence to open position (AI guided)
 	MinConfidence int `json:"min_confidence"`
+}
+
+// EffectiveEquityMaxLeverage returns the equity leverage cap, falling back to the
+// altcoin cap for configs saved before the field existed.
+func (r RiskControlConfig) EffectiveEquityMaxLeverage() int {
+	if r.EquityMaxLeverage > 0 {
+		return r.EquityMaxLeverage
+	}
+	return r.AltcoinMaxLeverage
+}
+
+// EffectiveCommodityMaxLeverage returns the commodity/FX leverage cap, falling
+// back to the altcoin cap for older configs.
+func (r RiskControlConfig) EffectiveCommodityMaxLeverage() int {
+	if r.CommodityMaxLeverage > 0 {
+		return r.CommodityMaxLeverage
+	}
+	return r.AltcoinMaxLeverage
 }
 
 // NewStrategyStore creates a new StrategyStore
@@ -259,6 +283,8 @@ func GetDefaultStrategyConfig(lang string) StrategyConfig {
 			MaxPositions:                    3,   // Max 3 coins simultaneously (CODE ENFORCED)
 			BTCETHMaxLeverage:               5,   // BTC/ETH exchange leverage (AI guided)
 			AltcoinMaxLeverage:              5,   // Altcoin exchange leverage (AI guided)
+			EquityMaxLeverage:               5,   // US equity perps leverage (AI guided)
+			CommodityMaxLeverage:            10,  // Commodity/FX perps leverage (AI guided)
 			BTCETHMaxPositionValueRatio:     5.0, // BTC/ETH: max position = 5x equity (CODE ENFORCED)
 			AltcoinMaxPositionValueRatio:    1.0, // Altcoin: max position = 1x equity (CODE ENFORCED)
 			MaxMarginUsage:                  0.9, // Max 90% margin usage (CODE ENFORCED)
