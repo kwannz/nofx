@@ -3,12 +3,14 @@ package coinank
 import (
 	"context"
 	"encoding/json"
+	"nofx/internal/testutil"
 	"nofx/provider/coinank/coinank_enum"
 	"testing"
 	"time"
 )
 
 func TestLiquidationExchangeStatistics(t *testing.T) {
+	testutil.RequireLive(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.LiquidationExchangeStatistics(context.TODO(), "BTC")
 	if err != nil {
@@ -25,6 +27,7 @@ func TestLiquidationExchangeStatistics(t *testing.T) {
 }
 
 func TestLiquidationCoinAggHistory(t *testing.T) {
+	testutil.RequireLive(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.LiquidationCoinAggHistory(context.TODO(), "BTC", coinank_enum.Hour1, time.Now().UnixMilli(), 10)
 	if err != nil {
@@ -41,6 +44,7 @@ func TestLiquidationCoinAggHistory(t *testing.T) {
 }
 
 func TestLiquidationHistory(t *testing.T) {
+	testutil.RequireLive(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.LiquidationHistory(context.TODO(), coinank_enum.Binance, "BTCUSDT", coinank_enum.Hour1, time.Now().UnixMilli(), 10)
 	if err != nil {
@@ -57,6 +61,7 @@ func TestLiquidationHistory(t *testing.T) {
 }
 
 func TestLiquidationOrders(t *testing.T) {
+	testutil.RequireLive(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.LiquidationOrders(context.TODO(), "BTC", coinank_enum.Binance, "long", 1000, time.Now().UnixMilli())
 	if err != nil {
@@ -73,6 +78,7 @@ func TestLiquidationOrders(t *testing.T) {
 }
 
 func TestLiquidationOrdersNoArgs(t *testing.T) {
+	testutil.RequireLive(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.LiquidationOrders(context.TODO(), "", "", "", 0, 0)
 	if err != nil {

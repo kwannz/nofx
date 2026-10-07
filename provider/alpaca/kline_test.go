@@ -4,10 +4,16 @@ import (
 	"context"
 	"fmt"
 	"testing"
+
+	"nofx/internal/testutil"
 )
 
 func TestGetBars(t *testing.T) {
+	testutil.RequireLive(t)
 	client := NewClient()
+	if client.apiKey == "" || client.secretKey == "" {
+		t.Skip("ALPACA_API_KEY / ALPACA_SECRET_KEY not set")
+	}
 
 	resp, err := client.GetBars(context.TODO(), "AAPL", "1Day", 5)
 	if err != nil {

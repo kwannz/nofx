@@ -139,7 +139,7 @@ sudo apt-get install libta-lib0-dev
 ### 5. Test Your Changes
 
 ```bash
-# Run backend tests
+# Run backend tests (hermetic: no network, no API keys needed)
 go test ./...
 
 # Build backend
@@ -152,6 +152,29 @@ npm run dev
 # Build frontend
 npm run build
 ```
+
+#### Live-network tests (`NOFX_LIVE_TESTS=1`)
+
+CI runs `go test -race ./...` without `-short`, so the default test run must be
+hermetic. Tests that call real exchanges, data providers or LLM endpoints
+(Bitget, CoinAnk, Alpaca, Hyperliquid public API, Qwen, ...) are **skipped
+unless `NOFX_LIVE_TESTS=1`** is set.
+
+```bash
+# Run the live Bitget smoke tests (needs internet access, no API keys)
+make test-live
+# equivalent to:
+NOFX_LIVE_TESTS=1 go test ./provider/... ./market/ ./trader/ -run Live
+
+# Run every live test of one package (some also need API keys, see the test source)
+NOFX_LIVE_TESTS=1 go test -count=1 -v ./provider/hyperliquid/
+```
+
+When you add a test that talks to a real network endpoint, call
+`testutil.RequireLive(t)` (from `nofx/internal/testutil`) as its first
+statement and put `Live` in the test name so `make test-live` picks it up.
+Tests that additionally need credentials keep their own env-var gate
+(for example `BITGET_DEMO_*`, `LIGHTER_TEST`, `BINANCE_LIVE_TEST`).
 
 ### 6. Commit Your Changes
 

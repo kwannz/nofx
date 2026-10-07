@@ -1,12 +1,14 @@
 package bitget
 
-import "testing"
+import (
+	"testing"
 
-// TestLiveBitget hits the real Bitget public API. Skipped with -short.
+	"nofx/internal/testutil"
+)
+
+// TestLiveBitget hits the real Bitget public API. Skipped unless NOFX_LIVE_TESTS=1.
 func TestLiveBitget(t *testing.T) {
-	if testing.Short() {
-		t.Skip("live network test")
-	}
+	testutil.RequireLive(t)
 	ResetCache()
 	wantClass := map[string]string{
 		"BTCUSDT": ClassCrypto, "ETHUSDT": ClassCrypto, "NVDAUSDT": ClassEquity, "XAUUSDT": ClassCommodity,

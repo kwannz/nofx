@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"nofx/internal/testutil"
 )
 
 // 阿里云百炼平台配置 (从环境变量获取)
@@ -23,6 +25,7 @@ var (
 
 // TestQwenBasicChat 测试基本同步对话
 func TestQwenBasicChat(t *testing.T) {
+	testutil.RequireLive(t)
 	agent := NewQwenAgent(QwenAppID, QwenAPIKey)
 	ctx := context.Background()
 
@@ -47,6 +50,7 @@ func TestQwenBasicChat(t *testing.T) {
 
 // TestQwenStreamChat 测试流式输出
 func TestQwenStreamChat(t *testing.T) {
+	testutil.RequireLive(t)
 	agent := NewQwenAgent(QwenAppID, QwenAPIKey)
 	ctx := context.Background()
 
@@ -76,6 +80,7 @@ func TestQwenStreamChat(t *testing.T) {
 
 // TestQwenMultiTurn 测试多轮对话（上下文记忆）
 func TestQwenMultiTurn(t *testing.T) {
+	testutil.RequireLive(t)
 	agent := NewQwenAgent(QwenAppID, QwenAPIKey)
 	ctx := context.Background()
 
@@ -105,6 +110,7 @@ func TestQwenMultiTurn(t *testing.T) {
 
 // TestQwenResetSession 测试重置会话
 func TestQwenResetSession(t *testing.T) {
+	testutil.RequireLive(t)
 	agent := NewQwenAgent(QwenAppID, QwenAPIKey)
 	ctx := context.Background()
 
@@ -137,6 +143,7 @@ func TestQwenResetSession(t *testing.T) {
 
 // TestQwenCodeGeneration 测试代码生成能力
 func TestQwenCodeGeneration(t *testing.T) {
+	testutil.RequireLive(t)
 	agent := NewQwenAgent(QwenAppID, QwenAPIKey)
 	ctx := context.Background()
 
@@ -159,6 +166,7 @@ func TestQwenCodeGeneration(t *testing.T) {
 
 // TestQwenJSONOutput 测试 JSON 格式输出
 func TestQwenJSONOutput(t *testing.T) {
+	testutil.RequireLive(t)
 	agent := NewQwenAgent(QwenAppID, QwenAPIKey)
 	ctx := context.Background()
 
@@ -193,6 +201,7 @@ func TestQwenJSONOutput(t *testing.T) {
 
 // TestQwenLongResponse 测试长文本生成
 func TestQwenLongResponse(t *testing.T) {
+	testutil.RequireLive(t)
 	agent := NewQwenAgent(QwenAppID, QwenAPIKey)
 	ctx := context.Background()
 
@@ -223,6 +232,7 @@ func TestQwenLongResponse(t *testing.T) {
 
 // TestQwenTradingScenario 测试交易场景问答
 func TestQwenTradingScenario(t *testing.T) {
+	testutil.RequireLive(t)
 	agent := NewQwenAgent(QwenAppID, QwenAPIKey)
 	ctx := context.Background()
 
@@ -253,6 +263,7 @@ func TestQwenTradingScenario(t *testing.T) {
 
 // TestQwenErrorHandling 测试错误处理
 func TestQwenErrorHandling(t *testing.T) {
+	testutil.RequireLive(t)
 	ctx := context.Background()
 
 	// 测试无效 API Key
@@ -280,6 +291,7 @@ func TestQwenErrorHandling(t *testing.T) {
 
 // TestQwenSpecialCharacters 测试特殊字符处理
 func TestQwenSpecialCharacters(t *testing.T) {
+	testutil.RequireLive(t)
 	agent := NewQwenAgent(QwenAppID, QwenAPIKey)
 	ctx := context.Background()
 
@@ -309,6 +321,7 @@ func TestQwenSpecialCharacters(t *testing.T) {
 
 // TestQwenConcurrentSessions 测试并发会话
 func TestQwenConcurrentSessions(t *testing.T) {
+	testutil.RequireLive(t)
 	agent1 := NewQwenAgent(QwenAppID, QwenAPIKey)
 	agent2 := NewQwenAgent(QwenAppID, QwenAPIKey)
 	ctx := context.Background()
@@ -345,6 +358,7 @@ func TestQwenConcurrentSessions(t *testing.T) {
 
 // TestQwenTimeout 测试超时处理
 func TestQwenTimeout(t *testing.T) {
+	testutil.RequireLive(t)
 	agent := NewQwenAgent(QwenAppID, QwenAPIKey)
 	agent.Client.Timeout = 1 * time.Millisecond // 极短超时
 
@@ -363,6 +377,7 @@ func TestQwenTimeout(t *testing.T) {
 
 // TestQwenContextCancel 测试上下文取消
 func TestQwenContextCancel(t *testing.T) {
+	testutil.RequireLive(t)
 	agent := NewQwenAgent(QwenAppID, QwenAPIKey)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -378,6 +393,7 @@ func TestQwenContextCancel(t *testing.T) {
 
 // TestQwenWithBizParams 测试带业务参数的调用
 func TestQwenWithBizParams(t *testing.T) {
+	testutil.RequireLive(t)
 	agent := NewQwenAgent(QwenAppID, QwenAPIKey)
 	ctx := context.Background()
 

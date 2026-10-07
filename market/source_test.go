@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"nofx/internal/testutil"
 	"nofx/provider/bitget"
 )
 
@@ -205,11 +206,9 @@ func TestNormalizeForSource(t *testing.T) {
 	}
 }
 
-// TestLiveBitgetSource uses the real Bitget API. Skipped with -short.
+// TestLiveBitgetSource uses the real Bitget API. Skipped unless NOFX_LIVE_TESTS=1.
 func TestLiveBitgetSource(t *testing.T) {
-	if testing.Short() {
-		t.Skip("live network test")
-	}
+	testutil.RequireLive(t)
 	for _, sym := range []string{"BTCUSDT", "ETHUSDT", "NVDAUSDT", "XAUUSDT"} {
 		d, err := GetWithTimeframesFromSource(sym, []string{"3m", "15m", "4h"}, "3m", 30, SourceBitget)
 		if err != nil {

@@ -3,12 +3,14 @@ package coinank
 import (
 	"context"
 	"encoding/json"
+	"nofx/internal/testutil"
 	"nofx/provider/coinank/coinank_enum"
 	"testing"
 	"time"
 )
 
 func TestOpenInterestAll(t *testing.T) {
+	testutil.RequireLive(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.OpenInterestAll(context.TODO(), "BTC")
 	if err != nil {
@@ -25,6 +27,7 @@ func TestOpenInterestAll(t *testing.T) {
 }
 
 func TestOpenInterestChartV2(t *testing.T) {
+	testutil.RequireLive(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.OpenInterestChartV2(context.TODO(), "BTC", coinank_enum.Binance, coinank_enum.Hour1, 10)
 	if err != nil {
@@ -38,6 +41,7 @@ func TestOpenInterestChartV2(t *testing.T) {
 }
 
 func TestOpenInterestSymbolChart(t *testing.T) {
+	testutil.RequireLive(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.OpenInterestSymbolChart(context.TODO(), coinank_enum.Binance, "BTCUSDT", coinank_enum.Hour1, time.Now().UnixMilli(), 10)
 	if err != nil {
@@ -54,6 +58,7 @@ func TestOpenInterestSymbolChart(t *testing.T) {
 }
 
 func TestOpenInterestKline(t *testing.T) {
+	testutil.RequireLive(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.OpenInterestKline(context.TODO(), coinank_enum.Binance, "BTCUSDT", coinank_enum.Hour1, time.Now().UnixMilli(), 10)
 	if err != nil {
@@ -67,6 +72,7 @@ func TestOpenInterestKline(t *testing.T) {
 }
 
 func TestOpenInterestAggKline(t *testing.T) {
+	testutil.RequireLive(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.OpenInterestAggKline(context.TODO(), "BTC", coinank_enum.Hour1, time.Now().UnixMilli(), 10)
 	if err != nil {
@@ -80,6 +86,7 @@ func TestOpenInterestAggKline(t *testing.T) {
 }
 
 func TestTickersTopOIByEx(t *testing.T) {
+	testutil.RequireLive(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.TickersTopOIByEx(context.TODO(), "BTC")
 	if err != nil {
@@ -93,6 +100,7 @@ func TestTickersTopOIByEx(t *testing.T) {
 }
 
 func TestInstrumentsOiVsMc(t *testing.T) {
+	testutil.RequireLive(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.InstrumentsOiVsMc(context.TODO(), "BTC", coinank_enum.Hour1, time.Now().UnixMilli(), 10)
 	if err != nil {

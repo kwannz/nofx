@@ -205,8 +205,8 @@ go test -short -race ./trader/ -run 'Paper|Bitget'
 # 决策内核、行情、Bitget provider
 go test -short ./kernel/ ./market/ ./provider/bitget/
 
-# 联网的实时数据测试（需要能访问 Bitget 公开接口）
-go test ./provider/bitget/ ./market/ -run Live -v
+# 联网的实时数据测试（需要能访问 Bitget 公开接口；默认跳过，需要 NOFX_LIVE_TESTS=1）
+NOFX_LIVE_TESTS=1 go test ./provider/bitget/ ./market/ -run Live -v
 
 # 官方 Demo 集成测试（需要 Demo Key，三个环境变量未设置时跳过）
 BITGET_DEMO_API_KEY=... BITGET_DEMO_SECRET_KEY=... BITGET_DEMO_PASSPHRASE=... \

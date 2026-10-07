@@ -3,12 +3,14 @@ package coinank
 import (
 	"context"
 	"encoding/json"
+	"nofx/internal/testutil"
 	"nofx/provider/coinank/coinank_enum"
 	"testing"
 	"time"
 )
 
 func TestNetPositions(t *testing.T) {
+	testutil.RequireLive(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.NetPositions(context.TODO(), coinank_enum.Binance, "BTCUSDT", coinank_enum.Hour1, time.Now().UnixMilli(), 10)
 	if err != nil {

@@ -3,11 +3,13 @@ package coinank
 import (
 	"context"
 	"encoding/json"
+	"nofx/internal/testutil"
 	"nofx/provider/coinank/coinank_enum"
 	"testing"
 )
 
 func TestListCoin(t *testing.T) {
+	testutil.RequireLive(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.ListCoin(context.TODO(), "SPOT")
 	if err != nil {
@@ -21,6 +23,7 @@ func TestListCoin(t *testing.T) {
 }
 
 func TestListSymbols(t *testing.T) {
+	testutil.RequireLive(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.ListSymbols(context.TODO(), "Binance", "SWAP")
 	if err != nil {
