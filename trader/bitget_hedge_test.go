@@ -27,12 +27,15 @@ func TestBitgetHedgeOrderBodies(t *testing.T) {
 		call      func(tr *BitgetTrader) (map[string]interface{}, error)
 		side      string
 		tradeSide string
+		reduce    string // "YES" on closes (fail-safe), absent on opens
 	}{
-		// hedge: side = POSITION direction, tradeSide = open|close, never reduceOnly
-		{"OpenLong", func(tr *BitgetTrader) (map[string]interface{}, error) { return tr.OpenLong("BTCUSDT", 0.0015, 5) }, "buy", "open"},
-		{"OpenShort", func(tr *BitgetTrader) (map[string]interface{}, error) { return tr.OpenShort("BTCUSDT", 0.0015, 5) }, "sell", "open"},
-		{"CloseLong", func(tr *BitgetTrader) (map[string]interface{}, error) { return tr.CloseLong("BTCUSDT", 0.0015) }, "buy", "close"},
-		{"CloseShort", func(tr *BitgetTrader) (map[string]interface{}, error) { return tr.CloseShort("BTCUSDT", 0.0015) }, "sell", "close"},
+		// hedge: side = POSITION direction, tradeSide = open|close; closes also carry reduceOnly=YES
+		// (Bitget ignores it in hedge mode, but a close routed to a one-way account then fails as
+		// reduce-only instead of adding exposure)
+		{"OpenLong", func(tr *BitgetTrader) (map[string]interface{}, error) { return tr.OpenLong("BTCUSDT", 0.0015, 5) }, "buy", "open", ""},
+		{"OpenShort", func(tr *BitgetTrader) (map[string]interface{}, error) { return tr.OpenShort("BTCUSDT", 0.0015, 5) }, "sell", "open", ""},
+		{"CloseLong", func(tr *BitgetTrader) (map[string]interface{}, error) { return tr.CloseLong("BTCUSDT", 0.0015) }, "buy", "close", "YES"},
+		{"CloseShort", func(tr *BitgetTrader) (map[string]interface{}, error) { return tr.CloseShort("BTCUSDT", 0.0015) }, "sell", "close", "YES"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -45,8 +48,10 @@ func TestBitgetHedgeOrderBodies(t *testing.T) {
 			if b["side"] != tc.side || b["tradeSide"] != tc.tradeSide {
 				t.Errorf("side/tradeSide = %v/%v, want %s/%s (body %v)", b["side"], b["tradeSide"], tc.side, tc.tradeSide, b)
 			}
-			if _, has := b["reduceOnly"]; has {
-				t.Errorf("reduceOnly must not be sent in hedge mode: %v", b)
+			if ro, has := b["reduceOnly"]; tc.reduce == "" && has {
+				t.Errorf("an opening order must not be reduceOnly: %v", b)
+			} else if tc.reduce != "" && ro != tc.reduce {
+				t.Errorf("a hedge close must carry reduceOnly=%s as a fail-safe: %v", tc.reduce, b)
 			}
 			if b["symbol"] != "BTCUSDT" || b["productType"] != "USDT-FUTURES" || b["marginCoin"] != "USDT" ||
 				b["orderType"] != "market" || b["marginMode"] != "crossed" || b["size"] != "0.001" {
@@ -495,14 +500,17 @@ func TestBitgetOrderRetriesOnceAfterModeMismatch(t *testing.T) {
 			t.Fatalf("expected exactly one retry, got %d order requests", len(reqs))
 		}
 		first, second := reqs[0].Body, reqs[1].Body
-		if first["tradeSide"] != "close" || first["side"] != "buy" {
-			t.Errorf("first attempt must be a hedge close: %v", first)
+		if first["tradeSide"] != "close" || first["side"] != "buy" || first["reduceOnly"] != "YES" {
+			t.Errorf("first attempt must be a reduce-only hedge close: %v", first)
 		}
 		if second["tradeSide"] != nil || second["side"] != "sell" || second["reduceOnly"] != "YES" {
 			t.Errorf("retry must be a one-way close: %v", second)
 		}
 		if first["clientOid"] == second["clientOid"] {
 			t.Errorf("the retry needs a fresh clientOid")
+		}
+		if first["size"] != second["size"] || first["symbol"] != second["symbol"] {
+			t.Errorf("the retry must be the same order, first %v retry %v", first, second)
 		}
 		if tr.PositionMode() != BitgetPositionModeOneWay {
 			t.Errorf("mode must be refreshed to one_way, got %q", tr.PositionMode())
@@ -566,6 +574,24 @@ func TestBitgetOrderRetriesOnceAfterModeMismatch(t *testing.T) {
 		}
 		if n := len(f.find(bitgetOrderPath)); n != 1 {
 			t.Errorf("no retry expected, got %d attempts", n)
+		}
+	})
+	t.Run("a close failing for any other reason is never resubmitted", func(t *testing.T) {
+		// only a definitive 40774 (rejected by validation, never executed) is retried; a system error or
+		// an unknown outcome must surface instead of risking a second close/open
+		for _, code := range []string{"50000", "40762", "45110"} {
+			tr, f := newTestBitgetMode(t, false, bitgetPosModeHedge)
+			f.fail(bitgetOrderPath, code, "system busy")
+			if _, err := tr.CloseLong("BTCUSDT", 0.001); err == nil {
+				t.Fatalf("%s: expected an error", code)
+			}
+			reqs := f.find(bitgetOrderPath)
+			if len(reqs) != 1 || reqs[0].Body["tradeSide"] != "close" || reqs[0].Body["reduceOnly"] != "YES" {
+				t.Errorf("%s: exactly one reduce-only hedge close expected, got %+v", code, reqs)
+			}
+			if n := len(f.find(bitgetAccountDetailPath)); n != 0 {
+				t.Errorf("%s: no mode re-detection expected, got %d", code, n)
+			}
 		}
 	})
 	t.Run("other errors never trigger a mode refresh", func(t *testing.T) {

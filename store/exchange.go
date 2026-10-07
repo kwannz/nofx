@@ -55,8 +55,9 @@ type Exchange struct {
 	LighterAPIKeyPrivateKey crypto.EncryptedString `gorm:"column:lighter_api_key_private_key;default:''" json:"lighterAPIKeyPrivateKey"`
 	LighterAPIKeyIndex      int             `gorm:"column:lighter_api_key_index;default:0" json:"lighterAPIKeyIndex"`
 
-	// BitgetPositionMode is the position mode of bitget / bitget_paper accounts: "hedge"
-	// (default, existing rows get it from the column default) or "one_way".
+	// BitgetPositionMode is the position mode of bitget / bitget_paper accounts: "hedge" (the
+	// default of new rows) or "one_way". Rows that existed before the column was added are set to
+	// "one_way" by initTables (nofx forced one-way mode back then).
 	BitgetPositionMode string `gorm:"column:bitget_position_mode;not null;default:hedge" json:"bitgetPositionMode"`
 
 	CreatedAt time.Time `json:"created_at"`
@@ -70,15 +71,20 @@ func NewExchangeStore(db *gorm.DB) *ExchangeStore {
 	return &ExchangeStore{db: db}
 }
 
+const bitgetPositionModeColumn = "bitget_position_mode"
+
 func (s *ExchangeStore) initTables() error {
 	// For PostgreSQL with existing table, skip AutoMigrate
 	if s.db.Dialector.Name() == "postgres" {
 		var tableExists int64
-		s.db.Raw(`SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'exchanges'`).Scan(&tableExists)
+		if err := s.db.Raw(`SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'exchanges'`).Scan(&tableExists).Error; err != nil {
+			return fmt.Errorf("failed to check the exchanges table: %w", err)
+		}
 		if tableExists > 0 {
-			// Columns added after the table was first created (AutoMigrate is skipped here);
-			// existing rows get the default (hedge)
-			s.db.Exec(`ALTER TABLE exchanges ADD COLUMN IF NOT EXISTS bitget_position_mode TEXT NOT NULL DEFAULT 'hedge'`)
+			// Columns added after the table was first created (AutoMigrate is skipped here)
+			if err := s.addBitgetPositionModeColumnPostgres(); err != nil {
+				return err
+			}
 			// Still run data migrations
 			s.migrateToMultiAccount()
 			s.db.Model(&Exchange{}).Where("account_name = '' OR account_name IS NULL").Update("account_name", "Default")
@@ -86,7 +92,7 @@ func (s *ExchangeStore) initTables() error {
 		}
 	}
 
-	if err := s.db.AutoMigrate(&Exchange{}); err != nil {
+	if err := s.autoMigrateExchanges(); err != nil {
 		return err
 	}
 
@@ -99,6 +105,60 @@ func (s *ExchangeStore) initTables() error {
 	s.db.Model(&Exchange{}).Where("account_name = '' OR account_name IS NULL").Update("account_name", "Default")
 
 	return nil
+}
+
+// autoMigrateExchanges runs AutoMigrate for the exchanges table. When the table already exists
+// without the bitget_position_mode column, its rows are exchange accounts that were created while
+// nofx forced Bitget into one-way mode: they must keep that behaviour, only NEW accounts default
+// to hedge. The column is added (default hedge) and the existing rows are set to one_way in one
+// transaction, so a failure in between cannot leave them on the new default. The backfill runs
+// exactly once: afterwards the column exists and later starts leave the stored values alone.
+func (s *ExchangeStore) autoMigrateExchanges() error {
+	m := s.db.Migrator()
+	backfillOneWay := m.HasTable(&Exchange{}) && !m.HasColumn(&Exchange{}, bitgetPositionModeColumn)
+	if !backfillOneWay {
+		return s.db.AutoMigrate(&Exchange{})
+	}
+
+	logger.Infof("🔄 Adding exchanges.%s: existing exchange accounts keep one-way mode", bitgetPositionModeColumn)
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.AutoMigrate(&Exchange{}); err != nil {
+			return fmt.Errorf("failed to add exchanges.%s: %w", bitgetPositionModeColumn, err)
+		}
+		if err := tx.Exec(`UPDATE exchanges SET bitget_position_mode = ?`, BitgetPositionModeOneWay).Error; err != nil {
+			return fmt.Errorf("failed to set existing exchanges to one-way Bitget position mode: %w", err)
+		}
+		return nil
+	})
+}
+
+// addBitgetPositionModeColumnPostgres adds exchanges.bitget_position_mode to a table created
+// before it existed. AutoMigrate is not used for existing PostgreSQL tables. The column is added
+// with default 'one_way' (PostgreSQL backfills the existing rows with it: they were created while
+// nofx forced one-way mode) and the default is then switched to 'hedge' for new rows. Both
+// statements run in one transaction (PostgreSQL DDL is transactional) and only when the column is
+// missing, so a later start never touches the stored modes again.
+func (s *ExchangeStore) addBitgetPositionModeColumnPostgres() error {
+	var exists int64
+	if err := s.db.Raw(`SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'exchanges' AND column_name = ?`, bitgetPositionModeColumn).
+		Scan(&exists).Error; err != nil {
+		return fmt.Errorf("failed to check exchanges.%s: %w", bitgetPositionModeColumn, err)
+	}
+	if exists > 0 {
+		return nil
+	}
+
+	logger.Infof("🔄 Adding exchanges.%s: existing exchange accounts keep one-way mode", bitgetPositionModeColumn)
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(`ALTER TABLE exchanges ADD COLUMN ` + bitgetPositionModeColumn + ` TEXT NOT NULL DEFAULT 'one_way'`).Error; err != nil {
+			return fmt.Errorf("failed to add exchanges.%s: %w", bitgetPositionModeColumn, err)
+		}
+		if err := tx.Exec(`ALTER TABLE exchanges ALTER COLUMN ` + bitgetPositionModeColumn + ` SET DEFAULT 'hedge'`).Error; err != nil {
+			return fmt.Errorf("failed to set the default of exchanges.%s to hedge: %w", bitgetPositionModeColumn, err)
+		}
+		return nil
+	})
 }
 
 // migrateToMultiAccount migrates old schema (id=exchange_type) to new schema (id=UUID)
@@ -361,6 +421,7 @@ func (s *ExchangeStore) CreateLegacy(userID, id, name, typ string, enabled bool,
 		AsterUser:             asterUser,
 		AsterSigner:           asterSigner,
 		AsterPrivateKey:       crypto.EncryptedString(asterPrivateKey),
+		BitgetPositionMode:    BitgetPositionModeHedge, // new accounts default to hedge
 	}
 	return s.db.Where("id = ?", id).FirstOrCreate(exchange).Error
 }

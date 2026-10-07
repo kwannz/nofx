@@ -1242,6 +1242,50 @@ func TestPaperAutoTraderRecordingFlow(t *testing.T) {
 	}
 }
 
+// TestPaperFactoryPositionModeWiring: AutoTraderConfig.BitgetPositionMode reaches the paper account
+// ("one_way" -> one-way, "" / "hedge" -> hedge), and a rebuilt AutoTrader (stop -> start in the API)
+// applies a changed setting while the account is flat.
+func TestPaperFactoryPositionModeWiring(t *testing.T) {
+	build := func(t *testing.T, id, mode string) *BitgetPaperTrader {
+		t.Helper()
+		at, err := NewAutoTrader(AutoTraderConfig{
+			ID: id, Name: id, AIModel: "deepseek", Exchange: "bitget_paper",
+			InitialBalance: 5000, BitgetPositionMode: mode, StrategyConfig: &store.StrategyConfig{},
+		}, nil, "user-1")
+		if err != nil {
+			t.Fatalf("NewAutoTrader(bitget_paper, %q): %v", mode, err)
+		}
+		paper, ok := at.trader.(*BitgetPaperTrader)
+		if !ok {
+			t.Fatalf("trader is %T, want *BitgetPaperTrader", at.trader)
+		}
+		return paper
+	}
+	for _, tc := range []struct{ name, mode, want string }{
+		{"one_way", "one_way", BitgetPositionModeOneWay},
+		{"empty is hedge", "", BitgetPositionModeHedge},
+		{"hedge", "hedge", BitgetPositionModeHedge},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := "factory-mode-" + strings.ReplaceAll(tc.name, " ", "-")
+			defer ReleaseBitgetPaperTrader(id)
+			if got := build(t, id, tc.mode).PositionMode(); got != tc.want {
+				t.Fatalf("paper position mode = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	t.Run("rebuilt trader applies the changed setting while flat", func(t *testing.T) {
+		const id = "factory-mode-rebuild"
+		defer ReleaseBitgetPaperTrader(id)
+		if got := build(t, id, "one_way").PositionMode(); got != BitgetPositionModeOneWay {
+			t.Fatalf("first build: %q", got)
+		}
+		if got := build(t, id, "hedge").PositionMode(); got != BitgetPositionModeHedge {
+			t.Fatalf("rebuild with hedge: %q", got)
+		}
+	})
+}
+
 // TestPaperFactoryWiring: the AutoTrader factory builds the paper trader without keys, derives
 // the initial balance from it, keeps one account per trader ID across rebuilds (the API rebuilds
 // the AutoTrader on every start/update) and stops the matcher in Stop().

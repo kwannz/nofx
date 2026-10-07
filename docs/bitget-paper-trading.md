@@ -28,14 +28,15 @@
 | 数量 | 按合约 `sizeMultiplier` 向下取整。开仓数量低于 `minTradeNum` 或名义价值低于 `minTradeUSDT` 会被拒绝；平仓（reduce-only）不做最小值检查，保证残余仓位总能平掉。 |
 | 杠杆 | 每个标的单独设置，超过合约 `maxLever` 时自动截到上限。已有仓位保持开仓时的杠杆。 |
 | 保证金 | 开仓锁定 `名义价值 / 杠杆`，并先扣除手续费。可用余额不足以覆盖「保证金 + 手续费」时拒单。 |
-| 持仓模式 | 默认**双向持仓（hedge）**，与实盘 `bitget`、Binance、OKX 一致：同一标的可以同时持有多单和空单，两个仓位各有自己的开仓价、保证金、止盈止损、强平和资金费率。可选**单向持仓（one_way）**：同一标的只有一个方向，持有多单时开空单会报错（自动交易器会先平仓）。两种模式下同方向加仓都按加权平均更新开仓价。详见下面的「持仓模式（双向 / 单向）」。 |
+| 持仓模式 | **新建**的交易所账户默认**双向持仓（hedge）**，与实盘 `bitget`、Binance、OKX 一致（升级前已创建的账户保持 `one_way`，见下面的「持仓模式（双向 / 单向）」）：同一标的可以同时持有多单和空单，两个仓位各有自己的开仓价、保证金、止盈止损、强平和资金费率。可选**单向持仓（one_way）**：同一标的只有一个方向，持有多单时开空单会报错（自动交易器会先平仓）。两种模式下同方向加仓都按加权平均更新开仓价。详见下面的「持仓模式（双向 / 单向）」。 |
 | 保证金模式 | `SetMarginMode` 只做记录。无论全仓还是逐仓，强平判断都只看该仓位自己的保证金，可用余额不会为仓位补保证金。 |
 | 休市 | 美股/商品/外汇合约在周六 00:00 到周一 00:00（美东）休市，休市时拒绝开仓，平仓不受限制；合约状态不是 `normal` 时同样拒绝开仓。加密货币 7×24 可交易。美国节假日（NYSE 2025–2027 静态日历，含补休日和 13:00 ET 提前收盘日）只做标注、不拦截：Bitget 股票永续在假日照常 5×24 交易，所以假日和提前收盘后 `regularHours=false`，提示词标的信息行里的 note 会写明“US cash market closed (Thanksgiving)”或“US early close 13:00 ET”，并提醒流动性可能偏薄、复牌时价格可能跳空。真正的停牌仍以合约状态为准。日历之外的年份 note 会注明节假日未模拟。 |
 
 ### 持仓模式（双向 / 单向）
 
-- 模式由交易所账户的「持仓模式」设置决定（交易所配置里的下拉框，后端字段 `bitget_position_mode`，取值 `hedge` 或 `one_way`，默认 `hedge`；`bitget` 与 `bitget_paper` 共用这个设置）。
+- 模式由交易所账户的「持仓模式」设置决定（交易所配置里的下拉框，后端字段 `bitget_position_mode`，取值 `hedge` 或 `one_way`；`bitget` 与 `bitget_paper` 共用这个设置）。
   交易员加载时把设置应用到模拟账户。
+- **默认值**：新建的交易所账户默认 `hedge`。**引入这个设置之前已创建的交易所账户保持 `one_way`**（那时 nofx 强制单向），升级时数据库迁移一次性把它们写成 `one_way`（SQLite 与 PostgreSQL 都是），所以升级不会改变已有账户的行为；想用双向持仓，需要在交易所配置里手动改成 `hedge`（空仓时才会生效）。迁移只在添加该列时执行一次，之后不会再覆盖你的选择。
 - **只有账户空仓时才能切换**（与真实 Bitget 一致：有持仓或挂单时无法切换持仓模式）。有持仓时设置不会生效，日志里会有一条警告，账户继续沿用当前模式；全部平仓并重启交易员后才会应用新设置。
 - 双向持仓下：
   - 持仓以「标的 + 方向」为键。`GetPositions` 对同一标的返回两条记录（`long`、`short`）。`CloseLong` / `CloseShort` 只影响对应方向。
@@ -87,7 +88,7 @@
 - 快照内容：余额（可用资金和初始资金）、累计已实现盈亏、全部持仓（方向、数量、开仓价、杠杆、保证金、开仓时间、资金费率结算进度）、
   持仓上的止盈止损单、每个标的的杠杆与保证金模式设置、最近 500 条平仓记录和最近 500 笔成交（供 `GetOrderStatus` 与 `GetClosedPnL` 使用）、
   下一个订单序号，以及每个持仓的资金费率结算时间点（Unix 秒，按结算边界计算，`fundInterval` 变化时也不会多扣）。快照带 `"version": 3`，并记录 `"position_mode"`（`hedge` / `one_way`）；持仓列表里同一标的可以出现 long 和 short 两条（双向持仓）。
-  读取旧快照时会自动迁移：v1 → v2 把各持仓的资金费率结算进度重置为快照保存时间；v2 → v3 因为双向持仓出现之前所有账户都是单向的，**有持仓的账户按 `one_way` 迁移以保持原有行为**（不会突然允许反向开仓；全部平仓并重启交易员后才会应用交易所设置里的模式，默认 hedge），空账户没有需要保留的行为，直接采用默认值 `hedge`。
+  读取旧快照时会自动迁移：v1 → v2 把各持仓的资金费率结算进度重置为快照保存时间；v2 → v3 因为双向持仓出现之前所有账户都是单向的，**有持仓的账户按 `one_way` 迁移以保持原有行为**（不会突然允许反向开仓；全部平仓并重启交易员后才会应用交易所设置里的模式），空账户没有需要保留的行为，直接采用交易所设置里的模式（新建账户默认 `hedge`，升级前已创建的账户是 `one_way`）。
 - 每次状态变化（开仓、平仓、设置或取消止盈止损、杠杆与保证金模式变化、资金费率结算、止盈止损与强平成交）都会立即写盘：
   先写同目录下的临时文件，`fsync` 后原子重命名覆盖，所以不会出现写到一半的文件，也不会留下临时文件。
   写盘失败只记录警告，不会让这笔交易失败；下一次状态变化和交易员停止时会重试。
@@ -138,22 +139,24 @@ NOFX_LIVE_TESTS=1 go test -count=1 -v ./trader/ -run TestPaperLiveSmoke
 
 ### 实盘 / Demo 的持仓模式（双向 hedge / 单向 one_way）
 
-`bitget` 交易所（含 Demo）同样使用交易所账户上的「持仓模式」设置（`bitget_position_mode`，默认 `hedge`，已有账户升级后也按 `hedge` 处理；`bitget_paper` 共用同一个设置），已在 Bitget Demo 上逐项验证：
+`bitget` 交易所（含 Demo）同样使用交易所账户上的「持仓模式」设置（`bitget_position_mode`；`bitget_paper` 共用同一个设置）。**新建的交易所账户默认 `hedge`；升级前已创建的账户保持 `one_way`，直到你在 UI 里改掉它**（升级迁移一次性写入，之后不再覆盖）。以下已在 Bitget Demo 上逐项验证：
 
 - **检测与切换**：交易员创建时先用 `GET /api/v2/mix/account/account?symbol=BTCUSDT&productType=USDT-FUTURES&marginCoin=USDT` 读取账户当前的 `posMode`（`hedge_mode` / `one_way_mode`；账户列表接口 `accounts` 不返回它），与设置不一致时调用 `POST /api/v2/mix/account/set-position-mode` 切换。
   Bitget 只允许在**没有持仓、也没有挂单（含止盈止损计划单）**时切换，否则返回 `40920 Position or order exists, the position mode cannot be switched`。
   切换失败时交易员**按检测到的当前模式继续运行**，并在日志里给出明确警告；平掉所有仓位和挂单并重启交易员后设置才会生效。重复设置为相同模式返回成功。
-- **下单格式**（hedge）：`side` 是**仓位方向**（多单 `buy`、空单 `sell`），`tradeSide` 为 `open` / `close`，不发 `reduceOnly`
-  （Demo 实测：hedge 下带 `reduceOnly: YES` 的开仓单仍然正常开仓，该字段被忽略）。开多 `buy+open`，平多 `buy+close`，开空 `sell+open`，平空 `sell+close`。
+- **下单格式**（hedge）：`side` 是**仓位方向**（多单 `buy`、空单 `sell`），`tradeSide` 为 `open` / `close`。开多 `buy+open`，平多 `buy+close`，开空 `sell+open`，平空 `sell+close`。
+  开仓单不发 `reduceOnly`（Demo 实测：hedge 下带 `reduceOnly: YES` 的开仓单仍然正常开仓，该字段被忽略）；**平仓单额外带 `reduceOnly: YES` 作为兜底**（hedge 下被接受并忽略，实际由 `tradeSide=close` 决定）。
+  这样如果交易员对账户模式的判断错了，把 hedge 格式的平仓单发给了 one-way 账户，订单会因 reduce-only 被拒绝（one-way 账户本来就会因 `tradeSide` 返回 `40774`），而不会变成一笔加仓。
   one-way 下 `side` 是真实下单方向（平多 = `sell`），平仓用 `reduceOnly: YES`，且**不能**发 `tradeSide`。
 - **模式不匹配**：下单格式与账户模式不符时 Bitget 返回 `40774 The order type for unilateral position must also be the unilateral position type.`（两个方向文案相同）。
-  交易员收到后会重新检测账户模式、更新缓存并**重试一次**；检测失败时按相反模式重试。
+  交易员收到后会重新检测账户模式、更新缓存，并**按新模式重新构造订单**（新的 `clientOid`）**重试一次**；检测失败时按相反模式重试。`40774` 是下单前的参数校验拒绝，订单没有进入撮合，因此重试不会重复下单；其它任何错误（超时、系统错误、余额不足等）都不会重试。
 - **止盈止损**：`place-tpsl-order` 的 `holdSide` 在 hedge 下是 `long` / `short`，在 one-way 下是 `buy`（多）/ `sell`（空）；用错词汇返回 `43011 ... holdSide error`（one-way 收到 long/short）或 `43011 ... delegateType is error`（hedge 收到 buy/sell），交易员同样会刷新模式并重试一次。
   同一 `holdSide` 重复设置 `pos_loss` / `pos_profit` 是原地替换（orderId 不变，非法价格被拒绝时原单保持不变）；多空两侧的止盈止损互相独立。
   持仓平掉后该侧的止盈止损随之消失，另一侧不受影响。挂单列表里 hedge 的计划单 `posSide` 是 `long` / `short`、`tradeSide` 是 `close`。
 - **取消止盈止损**：`cancel-plan-order` 必须传计划单**自己的** `planType`（`pos_loss` / `pos_profit`）。传列表接口用的 `profit_loss` 时 Bitget 返回成功但 `successList` 为空、什么也没取消（one-way 与 hedge 都一样）。
   交易员按 planType 分组取消，并要求每个 id 都出现在 `successList` 中，否则报错。接口没有方向参数时 `CancelStopLossOrders` / `CancelTakeProfitOrders` / `CancelStopOrders` 取消该标的两侧；需要只取消一侧时用 `CancelStopLossOrdersForSide` / `CancelTakeProfitOrdersForSide` / `CancelStopOrdersForSide`。
 - **持仓与成交**：`all-position` 在 hedge 下对同一标的返回 `holdSide=long` 和 `holdSide=short` 两条。两条都开着时，Bitget 对两侧都返回荒谬的强平价（`60549679693.56`，约为标记价的 72 万倍；多空风险对冲），交易员把它当作「不适用」（0）。
+  强平价的合理性检查：任何仓位，强平价 ≤ 0、NaN/Inf、高于标记价 100 倍或低于标记价 1/100 都当作「不适用」（0）。**方向检查（多单强平价必须低于标记价、空单必须高于）只用于逐仓（`marginMode=isolated`）仓位**；全仓（`crossed`）仓位的强平价是账户级的共享价格，净多头账户上空单一侧也会报告同一个低于标记价的价格，所以全仓不做方向检查，两条腿都显示这个共享强平价。
   成交记录（`/fills`）里 hedge 的 `side` 是仓位方向、`tradeSide` 为 `open` / `close`、`posMode=hedge_mode`，因此开平仓永远不会歧义；订单同步里 hedge 成交的 `PositionSide` 记为 `LONG` / `SHORT`（one-way 为 `BOTH`），`Side` 记为真实下单方向。
 - **逐仓杠杆**：hedge + 逐仓下 `set-leverage` 带或不带 `holdSide` 都会同时设置多空两侧的杠杆。
 

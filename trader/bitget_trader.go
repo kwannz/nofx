@@ -645,26 +645,38 @@ func sanitizeBitgetLiquidationPrice(raw string) float64 {
 // positions that cannot be liquidated by price (see sanitizeBitgetPositionLiquidation).
 const bitgetLiqMaxMarkRatio = 100.0
 
-// sanitizeBitgetPositionLiquidation is sanitizeBitgetLiquidationPrice plus a plausibility check
-// against the mark price. Verified on Bitget Demo: with a long and a short of the same symbol open
-// in hedge mode on a cross account, BOTH legs report liquidationPrice "60549679693.55" (about
-// 725000 x the mark) - their risks offset, so there is no price liquidation. A long can only be
-// liquidated BELOW the mark and a short ABOVE it, and nothing beyond 100x the mark is actionable,
-// so anything else is "not applicable" (0 = no liquidation risk, the prompt-schema convention).
-func sanitizeBitgetPositionLiquidation(holdSide string, mark float64, raw string) float64 {
+// bitgetMarginModeIsolated is the marginMode of an isolated position ("crossed" otherwise).
+const bitgetMarginModeIsolated = "isolated"
+
+// sanitizeBitgetPositionLiquidation is sanitizeBitgetLiquidationPrice plus plausibility checks
+// against the mark price (0 = not applicable = no liquidation risk, the prompt-schema convention).
+//
+// Every position: nothing beyond 100x or below 1/100 of the mark is actionable. Verified on Bitget
+// Demo: with a long and a short of the same symbol open in hedge mode on a cross account BOTH legs
+// report liquidationPrice "60549679693.55" (about 725000 x the mark) - their risks offset, so there
+// is no price liquidation.
+//
+// Isolated positions only: a long can only be liquidated BELOW the mark and a short ABOVE it, so
+// the other side is bogus. Cross positions are NOT direction-checked: their liquidation price is
+// the account-wide one, so on a net-long cross account the short leg legitimately reports the same
+// below-mark price as the long leg (and the mirror image for a net-short account), and both legs
+// must show it.
+func sanitizeBitgetPositionLiquidation(holdSide, marginMode string, mark float64, raw string) float64 {
 	liq := sanitizeBitgetLiquidationPrice(raw)
 	if liq <= 0 || mark <= 0 {
 		return liq
 	}
-	if liq > mark*bitgetLiqMaxMarkRatio {
+	if liq > mark*bitgetLiqMaxMarkRatio || liq < mark/bitgetLiqMaxMarkRatio {
 		return 0
 	}
-	if holdSide == "short" {
-		if liq <= mark {
+	if strings.EqualFold(strings.TrimSpace(marginMode), bitgetMarginModeIsolated) {
+		if strings.EqualFold(holdSide, "short") {
+			if liq <= mark {
+				return 0
+			}
+		} else if liq >= mark {
 			return 0
 		}
-	} else if liq >= mark {
-		return 0
 	}
 	return liq
 }
@@ -699,6 +711,7 @@ func (t *BitgetTrader) GetPositions() ([]map[string]interface{}, error) {
 		UnrealizedPL     string `json:"unrealizedPL"`     // Unrealized P&L
 		Leverage         string `json:"leverage"`         // Leverage
 		LiquidationPrice string `json:"liquidationPrice"` // Liquidation price
+		MarginMode       string `json:"marginMode"`       // crossed, isolated
 		MarginSize       string `json:"marginSize"`       // Position margin
 		CTime            string `json:"cTime"`            // Create time
 		UTime            string `json:"uTime"`            // Update time
@@ -719,7 +732,7 @@ func (t *BitgetTrader) GetPositions() ([]map[string]interface{}, error) {
 		markPrice, _ := strconv.ParseFloat(pos.MarkPrice, 64)
 		unrealizedPnL, _ := strconv.ParseFloat(pos.UnrealizedPL, 64)
 		leverage, _ := strconv.ParseFloat(pos.Leverage, 64)
-		liqPrice := sanitizeBitgetPositionLiquidation(strings.ToLower(pos.HoldSide), markPrice, pos.LiquidationPrice)
+		liqPrice := sanitizeBitgetPositionLiquidation(pos.HoldSide, pos.MarginMode, markPrice, pos.LiquidationPrice)
 		cTime, _ := strconv.ParseInt(pos.CTime, 10, 64)
 		uTime, _ := strconv.ParseInt(pos.UTime, 10, 64)
 
@@ -931,6 +944,13 @@ func bitgetOrderSide(mode, direction string, closing bool) string {
 }
 
 // marketOrderBody builds the place-order body of a market order for the given account mode.
+//
+// Every close is reduceOnly, in both modes. In one-way mode it is what makes the order a close.
+// In hedge mode Bitget accepts and ignores reduceOnly (verified on Demo: the position is closed
+// by tradeSide=close on the position `side`), so it is a pure fail-safe: if the trader's belief
+// about the mode is wrong, the mis-routed close (a one-way account rejects tradeSide with 40774; if
+// it did not, side=<position direction> would be an order that adds to the position) is rejected
+// as a reduce-only violation instead of adding exposure.
 func (t *BitgetTrader) marketOrderBody(symbol, direction string, closing bool, qtyStr, mode string) map[string]interface{} {
 	body := map[string]interface{}{
 		"symbol":      symbol,
@@ -943,15 +963,15 @@ func (t *BitgetTrader) marketOrderBody(symbol, direction string, closing bool, q
 		"clientOid":   genBitgetClientOid(),
 	}
 	if mode == bitgetPosModeHedge {
-		// hedge mode: tradeSide is mandatory and reduceOnly does not exist (the close is
-		// tied to the position of `side`)
+		// hedge mode: tradeSide is mandatory (open|close) and ties the order to the position of `side`
 		if closing {
 			body["tradeSide"] = "close"
 		} else {
 			body["tradeSide"] = "open"
 		}
-	} else if closing {
-		// one-way mode: tradeSide must NOT be sent (40774); a close is a reduce-only order
+	}
+	// one-way mode must NOT send tradeSide (40774); a close is a reduce-only order there
+	if closing {
 		body["reduceOnly"] = "YES"
 	}
 	return body
@@ -961,6 +981,11 @@ func (t *BitgetTrader) marketOrderBody(symbol, direction string, closing bool, q
 // confirms the fill via order/detail. closing=false opens/adds, closing=true reduces. The
 // request format depends on the account's position mode (see bitgetOrderSide); if Bitget
 // rejects it with 40774 (mode mismatch) the mode is re-detected and the order is retried once.
+//
+// The retry cannot double-submit: it happens only after a definitive 40774 rejection (the order was
+// refused by validation and never reached the book), doRequest itself never retries, and any other
+// error (timeout, 5xx, insufficient balance, ...) is returned without a second attempt. The retry
+// body is rebuilt for the re-detected mode (new clientOid; the rejected one never created an order).
 func (t *BitgetTrader) placeMarketOrder(symbol, direction string, closing bool, quantity float64, label string) (map[string]interface{}, error) {
 	var qtyStr string
 	var err error

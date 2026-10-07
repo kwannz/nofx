@@ -643,6 +643,10 @@ func (tm *TraderManager) LoadTradersFromStore(st *store.Store) error {
 	return nil
 }
 
+// newAutoTrader builds the AutoTrader of a configured trader. It is a variable only so tests can
+// observe the AutoTraderConfig that addTraderFromStore assembles without reaching an exchange.
+var newAutoTrader = trader.NewAutoTrader
+
 // addTraderFromStore internal method: adds trader from store configuration
 func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg *store.AIModel, exchangeCfg *store.Exchange, st *store.Store) error {
 	if _, exists := tm.traders[traderCfg.ID]; exists {
@@ -741,7 +745,7 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 	}
 
 	// Create trader instance
-	at, err := trader.NewAutoTrader(traderConfig, st, traderCfg.UserID)
+	at, err := newAutoTrader(traderConfig, st, traderCfg.UserID)
 	if err != nil {
 		return fmt.Errorf("failed to create trader: %w", err)
 	}

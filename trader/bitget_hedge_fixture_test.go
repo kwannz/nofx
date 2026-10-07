@@ -46,8 +46,14 @@ func TestBitgetHedgeFixtureOpenCloseBothSides(t *testing.T) {
 		if b["side"] != s.side || b["tradeSide"] != s.tradeSide || b["size"] != "0.0001" || b["orderType"] != "market" || b["marginMode"] != "crossed" {
 			t.Errorf("%s: body = %v", s.name, b)
 		}
-		if _, has := b["reduceOnly"]; has {
-			t.Errorf("%s: reduceOnly must not be sent in hedge mode (Bitget ignores it: a reduceOnly open order still opened a position): %v", s.name, b)
+		// closes carry reduceOnly=YES as a fail-safe (Bitget ignores it in hedge mode); opens never do,
+		// a reduceOnly open order still opened a position there
+		wantRO := ""
+		if s.tradeSide == "close" {
+			wantRO = "YES"
+		}
+		if ro, _ := b["reduceOnly"].(string); ro != wantRO {
+			t.Errorf("%s: reduceOnly = %q, want %q: %v", s.name, ro, wantRO, b)
 		}
 	}
 	// the order detail of the real hedge close: filled, fee negative -> positive commission
@@ -98,26 +104,130 @@ func TestBitgetHedgeFixtureGetPositionsBothSides(t *testing.T) {
 
 func TestSanitizeBitgetPositionLiquidation(t *testing.T) {
 	for _, c := range []struct {
-		name, side string
-		mark       float64
-		raw        string
-		want       float64
+		name, side, marginMode string
+		mark                   float64
+		raw                    string
+		want                   float64
 	}{
-		{"real hedge leg (absurd)", "long", 83479.4, "60549679693.5589689660869565", 0},
-		{"real hedge short leg (absurd)", "short", 83479.4, "60549679693.5589689660869565", 0},
-		{"real one-way long (negative)", "long", 83344.1, "-279781303.0828121933333334", 0},
-		{"long below the mark is plausible", "long", 100, "60.5", 60.5},
-		{"short above the mark is plausible", "short", 100, "130.25", 130.25},
-		{"long above the mark is impossible", "long", 100, "130", 0},
-		{"short below the mark is impossible", "short", 100, "60", 0},
-		{"1x short at 2x entry is fine", "short", 100, "199", 199},
-		{"no mark price: only the basic sanitising", "long", 0, "130", 130},
-		{"empty", "long", 100, "", 0},
+		// real captured values
+		{"real hedge cross long leg (absurd)", "long", "crossed", 83479.4, "60549679693.5589689660869565", 0},
+		{"real hedge cross short leg (absurd)", "short", "crossed", 83479.4, "60549679693.5589689660869565", 0},
+		{"real one-way cross long (negative)", "long", "crossed", 83344.1, "-279781303.0828121933333334", 0},
+
+		// isolated: the direction check applies
+		{"isolated long below the mark is plausible", "long", "isolated", 100, "60.5", 60.5},
+		{"isolated short above the mark is plausible", "short", "isolated", 100, "130.25", 130.25},
+		{"isolated long above the mark is impossible", "long", "isolated", 100, "130", 0},
+		{"isolated long at the mark is impossible", "long", "isolated", 100, "100", 0},
+		{"isolated short below the mark is impossible", "short", "isolated", 100, "60", 0},
+		{"isolated short at the mark is impossible", "short", "isolated", 100, "100", 0},
+		{"isolated 1x short at 2x entry is fine", "short", "isolated", 100, "199", 199},
+		{"isolated marginMode is case-insensitive", "long", "Isolated", 100, "130", 0},
+
+		// crossed (or unspecified): the shared cross liquidation price shows on BOTH legs of a hedge
+		// account, so a short leg may carry a below-mark price (net-long account) and a long leg an
+		// above-mark one (net-short account)
+		{"cross long leg of a net-long account", "long", "crossed", 100, "60.5", 60.5},
+		{"cross short leg of a net-long account (same price, below the mark)", "short", "crossed", 100, "60.5", 60.5},
+		{"cross long leg of a net-short account (same price, above the mark)", "long", "crossed", 100, "130.25", 130.25},
+		{"cross short leg of a net-short account", "short", "crossed", 100, "130.25", 130.25},
+		{"marginMode missing is not direction-checked", "short", "", 100, "60", 60},
+
+		// plausibility bound, whatever the margin mode
+		{"cross above 100x the mark", "long", "crossed", 100, "10001", 0},
+		{"cross just below 100x the mark is kept", "short", "crossed", 100, "9999", 9999},
+		{"cross below mark/100", "short", "crossed", 100, "0.99", 0},
+		{"cross just above mark/100 is kept", "long", "crossed", 100, "1.01", 1.01},
+		{"isolated above 100x the mark", "short", "isolated", 100, "10001", 0},
+		{"isolated below mark/100", "long", "isolated", 100, "0.5", 0},
+		{"zero", "long", "crossed", 100, "0", 0},
+		{"negative", "short", "crossed", 100, "-5", 0},
+		{"NaN", "long", "crossed", 100, "NaN", 0},
+		{"+Inf", "long", "crossed", 100, "+Inf", 0},
+
+		{"no mark price: only the basic sanitising", "long", "isolated", 0, "130", 130},
+		{"empty", "long", "crossed", 100, "", 0},
 	} {
-		if got := sanitizeBitgetPositionLiquidation(c.side, c.mark, c.raw); got != c.want {
+		if got := sanitizeBitgetPositionLiquidation(c.side, c.marginMode, c.mark, c.raw); got != c.want {
 			t.Errorf("%s: %v, want %v", c.name, got, c.want)
 		}
 	}
+}
+
+// A net-long hedge account on cross margin: Bitget reports the account-wide liquidation price on both
+// legs, and it is below the mark. The short leg must show it too (the direction check is for isolated
+// positions only). The rows are the captured hedge_positions fixture with liquidationPrice replaced.
+func TestBitgetHedgeCrossLiquidationPriceShownOnBothLegs(t *testing.T) {
+	_, _, data := bitgetFixture(t, "hedge_positions")
+	var rows []map[string]interface{}
+	if err := json.Unmarshal(data, &rows); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		if r["marginMode"] != "crossed" || r["posMode"] != "hedge_mode" {
+			t.Fatalf("fixture changed: %v", r)
+		}
+	}
+
+	t.Run("net long: both legs below the mark", func(t *testing.T) {
+		tr, f := newTestBitgetHedge(t)
+		for _, r := range rows {
+			r["liquidationPrice"] = "70123.4"
+		}
+		rows[0]["total"], rows[0]["available"] = "0.0005", "0.0005" // the long leg is the bigger one
+		raw, _ := json.Marshal(rows)
+		f.set(bitgetPositionPath, string(raw))
+		pos, err := tr.GetPositions()
+		if err != nil || len(pos) != 2 {
+			t.Fatalf("positions = %v, err = %v", pos, err)
+		}
+		for _, p := range pos {
+			if p["liquidationPrice"].(float64) != 70123.4 {
+				t.Errorf("%v leg: liquidationPrice = %v, want the shared cross price 70123.4", p["side"], p["liquidationPrice"])
+			}
+		}
+	})
+
+	t.Run("net short: both legs above the mark", func(t *testing.T) {
+		tr, f := newTestBitgetHedge(t)
+		for _, r := range rows {
+			r["liquidationPrice"] = "95000.5"
+		}
+		raw, _ := json.Marshal(rows)
+		f.set(bitgetPositionPath, string(raw))
+		pos, err := tr.GetPositions()
+		if err != nil || len(pos) != 2 {
+			t.Fatalf("positions = %v, err = %v", pos, err)
+		}
+		for _, p := range pos {
+			if p["liquidationPrice"].(float64) != 95000.5 {
+				t.Errorf("%v leg: liquidationPrice = %v, want 95000.5", p["side"], p["liquidationPrice"])
+			}
+		}
+	})
+
+	t.Run("isolated legs keep the direction check", func(t *testing.T) {
+		tr, f := newTestBitgetHedge(t)
+		for _, r := range rows {
+			r["marginMode"] = "isolated"
+			r["liquidationPrice"] = "70123.4" // below the mark: fine for the long, impossible for the short
+		}
+		raw, _ := json.Marshal(rows)
+		f.set(bitgetPositionPath, string(raw))
+		pos, err := tr.GetPositions()
+		if err != nil || len(pos) != 2 {
+			t.Fatalf("positions = %v, err = %v", pos, err)
+		}
+		for _, p := range pos {
+			want := 70123.4
+			if p["side"] == "short" {
+				want = 0
+			}
+			if p["liquidationPrice"].(float64) != want {
+				t.Errorf("%v leg: liquidationPrice = %v, want %v", p["side"], p["liquidationPrice"], want)
+			}
+		}
+	})
 }
 
 func TestBitgetHedgeFixturePlanOrders(t *testing.T) {
@@ -330,8 +440,12 @@ func TestBitgetOrderRetryWithRealRejections(t *testing.T) {
 		if len(reqs) != 2 || reqs[0].Body["reduceOnly"] != "YES" || reqs[1].Body["tradeSide"] != "close" || reqs[1].Body["side"] != "sell" {
 			t.Fatalf("requests = %+v", reqs)
 		}
-		if _, has := reqs[1].Body["reduceOnly"]; has {
-			t.Errorf("no reduceOnly in hedge mode: %v", reqs[1].Body)
+		// the retry is a hedge close: it keeps the reduceOnly fail-safe next to tradeSide=close
+		if reqs[1].Body["reduceOnly"] != "YES" {
+			t.Errorf("a hedge close must stay reduce-only on the retry: %v", reqs[1].Body)
+		}
+		if reqs[0].Body["clientOid"] == reqs[1].Body["clientOid"] {
+			t.Errorf("the retry needs a fresh clientOid")
 		}
 	})
 }

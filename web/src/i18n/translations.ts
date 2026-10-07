@@ -447,7 +447,7 @@ export const translations = {
     bitgetPositionModeHedge: 'Hedge mode (long and short at the same time)',
     bitgetPositionModeOneWay: 'One-way mode (one net position per symbol)',
     bitgetPositionModeDescription:
-      'Hedge (default): the account can hold a LONG and a SHORT position of the same symbol at once, like Binance/OKX. One-way: one net position per symbol. On a live Bitget account the mode can only be switched while there are no open positions or pending/TP-SL orders; otherwise the trader keeps the account\'s current mode and logs a warning.',
+      'Hedge (default for new accounts): the account can hold a LONG and a SHORT position of the same symbol at once, like Binance/OKX. One-way: one net position per symbol. Accounts created before this setting existed stay one-way until you change them here. On a live Bitget account the mode can only be switched while there are no open positions or pending/TP-SL orders; otherwise the trader keeps the account\'s current mode and logs a warning.',
     securityWarning: 'Security Warning',
     saveConfiguration: 'Save Configuration',
 
@@ -1660,7 +1660,7 @@ export const translations = {
     bitgetPositionModeHedge: '双向持仓（可同时持有多仓和空仓）',
     bitgetPositionModeOneWay: '单向持仓（每个币种只有一个净仓位）',
     bitgetPositionModeDescription:
-      '双向持仓（默认）：同一币种可同时持有多仓和空仓，与 Binance/OKX 一致。单向持仓：每个币种只有一个净仓位。实盘 Bitget 账户只有在没有持仓、也没有挂单/止盈止损单时才能切换模式；否则交易员会沿用账户当前模式并记录警告。',
+      '双向持仓（新建账户默认）：同一币种可同时持有多仓和空仓，与 Binance/OKX 一致。单向持仓：每个币种只有一个净仓位。升级前已创建的账户保持单向持仓，直到你在这里修改。实盘 Bitget 账户只有在没有持仓、也没有挂单/止盈止损单时才能切换模式；否则交易员会沿用账户当前模式并记录警告。',
     securityWarning: '安全提示',
     saveConfiguration: '保存配置',
 
