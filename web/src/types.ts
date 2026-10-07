@@ -554,6 +554,8 @@ export interface RiskControlConfig {
   // Trading Leverage - exchange leverage for opening positions (AI guided)
   btc_eth_max_leverage: number;    // BTC/ETH max exchange leverage
   altcoin_max_leverage: number;    // Altcoin max exchange leverage
+  equity_max_leverage?: number;    // US equity/ETF perps max leverage (default 5; falls back to altcoin)
+  commodity_max_leverage?: number; // Commodity/FX perps max leverage (default 10; falls back to altcoin)
 
   // Position Value Ratio - single position notional value / account equity (CODE ENFORCED)
   // Max position value = equity × this ratio
