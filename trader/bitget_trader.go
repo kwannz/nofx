@@ -1072,13 +1072,23 @@ func (t *BitgetTrader) CancelAllOrders(symbol string) error {
 	return errors.Join(errs...)
 }
 
+// bitgetFloorQuantity floors quantity to a whole multiple of step (the contract's
+// sizeMultiplier). The small epsilon absorbs float noise such as 0.3/0.1 = 2.9999999999999996.
+// Shared by the live Bitget trader and the local paper trader.
+func bitgetFloorQuantity(quantity, step float64) float64 {
+	if step <= 0 {
+		return quantity
+	}
+	return math.Floor(quantity/step+1e-9) * step
+}
+
 // formatQuantityStep floors quantity to the contract's size step without min-size checks.
 func (t *BitgetTrader) formatQuantityStep(symbol string, quantity float64) (string, error) {
 	contract, err := t.getContract(t.convertSymbol(symbol))
 	if err != nil {
 		return "", err
 	}
-	qty := math.Floor(quantity/contract.SizeMultiplier+1e-9) * contract.SizeMultiplier
+	qty := bitgetFloorQuantity(quantity, contract.SizeMultiplier)
 	if qty <= 0 {
 		return "", fmt.Errorf("quantity %.8f for %s rounds to zero (step %v)", quantity, symbol, contract.SizeMultiplier)
 	}
@@ -1095,8 +1105,7 @@ func (t *BitgetTrader) FormatQuantity(symbol string, quantity float64) (string, 
 	}
 
 	mult := contract.SizeMultiplier
-	steps := math.Floor(quantity/mult + 1e-9)
-	qty := steps * mult
+	qty := bitgetFloorQuantity(quantity, mult)
 	if qty < contract.MinTradeNum-1e-12 {
 		return "", fmt.Errorf("quantity %.8f for %s is below minimum trade size %v (step %v)", quantity, symbol, contract.MinTradeNum, mult)
 	}

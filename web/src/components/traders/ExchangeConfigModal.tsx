@@ -22,6 +22,8 @@ const SUPPORTED_EXCHANGE_TEMPLATES = [
   { exchange_type: 'bybit', name: 'Bybit Futures', type: 'cex' as const },
   { exchange_type: 'okx', name: 'OKX Futures', type: 'cex' as const },
   { exchange_type: 'bitget', name: 'Bitget Futures', type: 'cex' as const },
+  // 本地模拟撮合：使用 Bitget 实时公开行情，不需要任何 API Key
+  { exchange_type: 'bitget_paper', name: 'Bitget Paper（本地模拟）', type: 'cex' as const },
   { exchange_type: 'hyperliquid', name: 'Hyperliquid', type: 'dex' as const },
   { exchange_type: 'aster', name: 'Aster DEX', type: 'dex' as const },
   { exchange_type: 'lighter', name: 'Lighter', type: 'dex' as const },
@@ -288,6 +290,9 @@ export function ExchangeConfigModal({
       } else if (currentExchangeType === 'bitget') {
         if (!apiKey.trim() || !secretKey.trim() || !passphrase.trim()) return
         await onSave(exchangeId, exchangeType, trimmedAccountName, apiKey.trim(), secretKey.trim(), passphrase.trim(), testnet)
+      } else if (currentExchangeType === 'bitget_paper') {
+        // 本地模拟交易所：不需要任何密钥
+        await onSave(exchangeId, exchangeType, trimmedAccountName, '', '', '', false)
       } else if (currentExchangeType === 'hyperliquid') {
         if (!apiKey.trim() || !hyperliquidWalletAddr.trim()) return // 验证私钥和钱包地址
         await onSave(
@@ -508,7 +513,22 @@ export function ExchangeConfigModal({
                   </div>
                 </div>
 
+                {/* Bitget Paper：无需密钥的说明 */}
+                {currentExchangeType === 'bitget_paper' && (
+                  <div
+                    className="mt-3 p-3 rounded text-xs"
+                    style={{
+                      background: 'rgba(14, 203, 129, 0.08)',
+                      border: '1px solid rgba(14, 203, 129, 0.25)',
+                      color: '#EAECEF',
+                    }}
+                  >
+                    {t('bitgetPaperDescription', language)}
+                  </div>
+                )}
+
                 {/* 注册链接 */}
+                {currentExchangeType !== 'bitget_paper' && (
                 <a
                   href={exchangeRegistrationLinks[currentExchangeType || '']?.url || '#'}
                   target="_blank"
@@ -535,6 +555,7 @@ export function ExchangeConfigModal({
                   </div>
                   <ExternalLink className="w-4 h-4" style={{ color: '#848E9C' }} />
                 </a>
+                )}
               </div>
             )}
 
@@ -1256,6 +1277,7 @@ export function ExchangeConfigModal({
                   currentExchangeType !== 'bybit' &&
                   currentExchangeType !== 'okx' &&
                   currentExchangeType !== 'bitget' &&
+                  currentExchangeType !== 'bitget_paper' &&
                   (!apiKey.trim() || !secretKey.trim()))
               }
               className="flex-1 px-4 py-2 rounded text-sm font-semibold disabled:opacity-50"

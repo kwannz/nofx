@@ -80,7 +80,7 @@ func (s *ExchangeStore) migrateToMultiAccount() error {
 	// Check if migration is needed by looking for old-style IDs (non-UUID)
 	var count int64
 	err := s.db.Model(&Exchange{}).
-		Where("exchange_type = '' AND id IN ?", []string{"binance", "bybit", "okx", "bitget", "hyperliquid", "aster", "lighter"}).
+		Where("exchange_type = '' AND id IN ?", []string{"binance", "bybit", "okx", "bitget", "bitget_paper", "hyperliquid", "aster", "lighter"}).
 		Count(&count).Error
 	if err != nil {
 		return err
@@ -94,7 +94,7 @@ func (s *ExchangeStore) migrateToMultiAccount() error {
 
 	// Get all old records
 	var records []Exchange
-	err = s.db.Where("exchange_type = '' AND id IN ?", []string{"binance", "bybit", "okx", "bitget", "hyperliquid", "aster", "lighter"}).
+	err = s.db.Where("exchange_type = '' AND id IN ?", []string{"binance", "bybit", "okx", "bitget", "bitget_paper", "hyperliquid", "aster", "lighter"}).
 		Find(&records).Error
 	if err != nil {
 		return err
@@ -167,6 +167,8 @@ func getExchangeNameAndType(exchangeType string) (name string, typ string) {
 		return "OKX Futures", "cex"
 	case "bitget":
 		return "Bitget Futures", "cex"
+	case "bitget_paper":
+		return "Bitget Paper", "cex"
 	case "hyperliquid":
 		return "Hyperliquid", "dex"
 	case "aster":
@@ -305,7 +307,7 @@ func (s *ExchangeStore) CreateLegacy(userID, id, name, typ string, enabled bool,
 	hyperliquidWalletAddr, asterUser, asterSigner, asterPrivateKey string) error {
 
 	// Check if this is an old-style ID (exchange type as ID)
-	if id == "binance" || id == "bybit" || id == "okx" || id == "bitget" || id == "hyperliquid" || id == "aster" || id == "lighter" {
+	if id == "binance" || id == "bybit" || id == "okx" || id == "bitget" || id == "bitget_paper" || id == "hyperliquid" || id == "aster" || id == "lighter" {
 		_, err := s.Create(userID, id, "Default", enabled, apiKey, secretKey, "", testnet,
 			hyperliquidWalletAddr, asterUser, asterSigner, asterPrivateKey, "", "", "", 0)
 		return err

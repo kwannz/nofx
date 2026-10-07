@@ -441,6 +441,8 @@ export const translations = {
     bitgetDemoMode: 'Demo trading (paptrading)',
     bitgetDemoDescription:
       'Use a Bitget Demo API key and trade with simulated funds. Real API keys will be rejected in this mode.',
+    bitgetPaperDescription:
+      'Local paper trading: orders are simulated in memory against live Bitget public prices (no API key needed). Fees, slippage, liquidation, SL/TP and funding are simulated; the account resets when the server restarts.',
     securityWarning: 'Security Warning',
     saveConfiguration: 'Save Configuration',
 
@@ -1636,6 +1638,8 @@ export const translations = {
     bitgetDemoMode: 'Demo 模拟交易 (paptrading)',
     bitgetDemoDescription:
       '使用 Bitget Demo API Key，以模拟资金交易。该模式下真实 API Key 会被拒绝。',
+    bitgetPaperDescription:
+      '本地模拟交易：订单在内存中按 Bitget 实时公开行情撮合，无需任何 API Key。会模拟手续费、滑点、强平、止盈止损和资金费率；服务重启后账户状态会重置。',
     securityWarning: '安全提示',
     saveConfiguration: '保存配置',
 

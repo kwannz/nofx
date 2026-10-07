@@ -23,7 +23,7 @@ type AutoTraderConfig struct {
 	AIModel string // AI model: "qwen" or "deepseek"
 
 	// Trading platform selection
-	Exchange   string // Exchange type: "binance", "bybit", "okx", "bitget", "hyperliquid", "aster" or "lighter"
+	Exchange   string // Exchange type: "binance", "bybit", "okx", "bitget", "bitget_paper", "hyperliquid", "aster" or "lighter"
 	ExchangeID string // Exchange account UUID (for multi-account support)
 
 	// Binance API configuration
@@ -234,6 +234,11 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 	case "bitget":
 		logger.Infof("🏦 [%s] Using Bitget Futures trading", config.Name)
 		trader = NewBitgetTraderWithOptions(config.BitgetAPIKey, config.BitgetSecretKey, config.BitgetPassphrase, config.BitgetTestnet)
+	case "bitget_paper":
+		logger.Infof("🏦 [%s] Using Bitget Paper trading (local simulation on live Bitget prices, initial balance %.2f)", config.Name, config.InitialBalance)
+		// The paper account is kept per trader ID: the API rebuilds the AutoTrader on every
+		// start/update, which must not reset the simulated balance and positions.
+		trader = AcquireBitgetPaperTrader(config.ID, config.InitialBalance)
 	case "hyperliquid":
 		logger.Infof("🏦 [%s] Using Hyperliquid trading", config.Name)
 		trader, err = NewHyperliquidTrader(config.HyperliquidPrivateKey, config.HyperliquidWalletAddr, config.HyperliquidTestnet)
@@ -402,6 +407,14 @@ func (at *AutoTrader) Run() error {
 		}
 	}
 
+	// Bitget Paper: persist matcher-triggered closes (SL/TP/liquidation) and start the matcher.
+	// Orders placed by this trader are recorded by recordAndConfirmOrder (not an OrderSync exchange).
+	if paperTrader, ok := at.trader.(*BitgetPaperTrader); ok {
+		paperTrader.SetSystemFillHandler(at.recordPaperSystemFill)
+		paperTrader.Start()
+		logger.Infof("🔄 [%s] Bitget Paper matcher started (SL/TP, liquidation, funding)", at.name)
+	}
+
 	// Start Aster order sync if using Aster exchange
 	if at.exchange == "aster" {
 		if asterTrader, ok := at.trader.(*AsterTrader); ok && at.store != nil {
@@ -461,6 +474,11 @@ func (at *AutoTrader) Stop() {
 
 	close(at.stopMonitorCh) // Notify monitoring goroutine to stop
 	at.monitorWg.Wait()     // Wait for monitoring goroutine to finish
+	if paperTrader, ok := at.trader.(*BitgetPaperTrader); ok {
+		// Stop the paper matcher goroutine. The account (positions, SL/TP, balance) is kept in
+		// memory but frozen until the trader runs again; see BitgetPaperTrader.Stop.
+		paperTrader.Stop()
+	}
 	logger.Info("⏹ Automatic trading system stopped")
 }
 
@@ -1362,6 +1380,12 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *kernel.Decision, act
 	return nil
 }
 
+// UnderlyingTrader returns the exchange trader this AutoTrader executes orders with. API
+// handlers use it for stateful traders (Bitget Paper) that cannot be re-created per request.
+func (at *AutoTrader) UnderlyingTrader() Trader {
+	return at.trader
+}
+
 // GetID gets trader ID
 func (at *AutoTrader) GetID() string {
 	return at.id
@@ -1789,17 +1813,27 @@ func (at *AutoTrader) emergencyClosePosition(symbol, side string) error {
 			return err
 		}
 		logger.Infof("✅ Emergency close long position succeeded, order ID: %v", order["orderId"])
+		at.recordEmergencyCloseIfUnsynced(symbol, side, order)
 	case "short":
 		order, err := at.trader.CloseShort(symbol, 0) // 0 = close all
 		if err != nil {
 			return err
 		}
 		logger.Infof("✅ Emergency close short position succeeded, order ID: %v", order["orderId"])
+		at.recordEmergencyCloseIfUnsynced(symbol, side, order)
 	default:
 		return fmt.Errorf("unknown position direction: %s", side)
 	}
 
 	return nil
+}
+
+// recordEmergencyCloseIfUnsynced records a drawdown-monitor close for exchanges without an
+// OrderSync (Bitget Paper); all other exchanges are synced from exchange trade history.
+func (at *AutoTrader) recordEmergencyCloseIfUnsynced(symbol, side string, order map[string]interface{}) {
+	if _, ok := at.trader.(*BitgetPaperTrader); ok {
+		at.RecordManualClose(symbol, side, 0, 0, order)
+	}
 }
 
 // GetPeakPnLCache gets peak profit cache
@@ -2008,6 +2042,38 @@ func (at *AutoTrader) recordPositionChange(orderID, symbol, side, action string,
 			logger.Infof("  ✅ Position closed [%s] %s %s @ %.4f", at.id[:8], symbol, side, price)
 		}
 	}
+}
+
+// RecordManualClose records a close executed outside the AI cycle (the one-click close API)
+// for exchanges that have no OrderSync, using the same bookkeeping as an AI close.
+func (at *AutoTrader) RecordManualClose(symbol, side string, quantity, entryPrice float64, order map[string]interface{}) {
+	action := "close_short"
+	if strings.EqualFold(side, "long") {
+		action = "close_long"
+	}
+	price, _ := order["avgPrice"].(float64)
+	at.recordAndConfirmOrder(order, symbol, action, quantity, price, 0, entryPrice)
+}
+
+// recordPaperSystemFill persists a fill the Bitget Paper matcher produced on its own
+// (stop loss, take profit, liquidation): order, fill and position close, the same records
+// recordAndConfirmOrder writes for orders the AI placed.
+func (at *AutoTrader) recordPaperSystemFill(f PaperFill) {
+	if at.store == nil {
+		return
+	}
+	orderRecord := at.createOrderRecord(f.OrderID, f.Symbol, f.Action, f.PositionSide, f.Quantity, f.Price, f.Leverage)
+	orderRecord.Type = "MARKET"
+	if err := at.store.Order().CreateOrder(orderRecord); err != nil {
+		logger.Infof("  ⚠️ Failed to record paper %s order: %v", f.Reason, err)
+		return
+	}
+	if err := at.store.Order().UpdateOrderStatus(orderRecord.ID, "FILLED", f.Quantity, f.Price, f.Fee); err != nil {
+		logger.Infof("  ⚠️ Failed to update paper %s order status: %v", f.Reason, err)
+	}
+	at.recordOrderFill(orderRecord.ID, f.OrderID, f.Symbol, f.Action, f.Price, f.Quantity, f.Fee)
+	at.recordPositionChange(f.OrderID, at.normalizeSymbol(f.Symbol), f.PositionSide, f.Action, f.Quantity, f.Price, f.Leverage, f.EntryPrice, f.Fee)
+	logger.Infof("  📝 [%s] Paper %s recorded: %s %s qty=%.6f @ %.6f pnl=%.4f", at.name, f.Reason, f.Symbol, f.PositionSide, f.Quantity, f.Price, f.RealizedPnL)
 }
 
 // createOrderRecord creates an order record struct from order details

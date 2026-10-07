@@ -14,6 +14,7 @@ import (
 	"nofx/manager"
 	"nofx/market"
 	"nofx/provider/alpaca"
+	"nofx/provider/bitget"
 	"nofx/provider/coinank/coinank_api"
 	"nofx/provider/coinank/coinank_enum"
 	"nofx/provider/hyperliquid"
@@ -443,7 +444,7 @@ type ExchangeConfig struct {
 // SafeExchangeConfig Safe exchange configuration structure (does not contain sensitive information)
 type SafeExchangeConfig struct {
 	ID                    string `json:"id"`            // UUID
-	ExchangeType          string `json:"exchange_type"` // "binance", "bybit", "okx", "hyperliquid", "aster", "lighter"
+	ExchangeType          string `json:"exchange_type"` // "binance", "bybit", "okx", "bitget", "bitget_paper", "hyperliquid", "aster", "lighter"
 	AccountName           string `json:"account_name"`  // User-defined account name
 	Name                  string `json:"name"`          // Display name
 	Type                  string `json:"type"`          // "cex" or "dex"
@@ -613,6 +614,10 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 				string(exchangeCfg.Passphrase),
 				exchangeCfg.Testnet,
 			)
+		case "bitget_paper":
+			// Local simulation: no keys. A throw-away account only reports the starting balance
+			// (the requested initial balance, default 10000); it never starts a matcher.
+			tempTrader = trader.NewBitgetPaperTrader(req.InitialBalance)
 		case "lighter":
 			if exchangeCfg.LighterWalletAddr != "" && string(exchangeCfg.LighterAPIKeyPrivateKey) != "" {
 				// Lighter only supports mainnet
@@ -895,6 +900,8 @@ func (s *Server) handleDeleteTrader(c *gin.Context) {
 
 	// Remove trader from memory
 	s.traderManager.RemoveTrader(traderID)
+	// Drop the in-memory Bitget Paper account (no-op for other exchanges)
+	trader.ReleaseBitgetPaperTrader(traderID)
 
 	logger.Infof("✓ Trader deleted: %s", traderID)
 	c.JSON(http.StatusOK, gin.H{"message": "Trader deleted"})
@@ -1158,6 +1165,15 @@ func (s *Server) handleSyncBalance(c *gin.Context) {
 			string(exchangeCfg.Passphrase),
 			exchangeCfg.Testnet,
 		)
+	case "bitget_paper":
+		// The simulated account lives in memory inside the loaded trader: a fresh instance
+		// would be empty, so use the running one.
+		liveTrader, liveErr := s.traderManager.GetTrader(traderID)
+		if liveErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Bitget Paper trader is not loaded; start the trader first"})
+			return
+		}
+		tempTrader = liveTrader.UnderlyingTrader()
 	case "lighter":
 		if exchangeCfg.LighterWalletAddr != "" && string(exchangeCfg.LighterAPIKeyPrivateKey) != "" {
 			// Lighter only supports mainnet
@@ -1311,6 +1327,15 @@ func (s *Server) handleClosePosition(c *gin.Context) {
 			string(exchangeCfg.Passphrase),
 			exchangeCfg.Testnet,
 		)
+	case "bitget_paper":
+		// The simulated account lives in memory inside the loaded trader: a fresh instance
+		// would be empty, so use the running one.
+		liveTrader, liveErr := s.traderManager.GetTrader(traderID)
+		if liveErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Bitget Paper trader is not loaded; start the trader first"})
+			return
+		}
+		tempTrader = liveTrader.UnderlyingTrader()
 	case "lighter":
 		if exchangeCfg.LighterWalletAddr != "" && string(exchangeCfg.LighterAPIKeyPrivateKey) != "" {
 			// Lighter only supports mainnet
@@ -1379,7 +1404,15 @@ func (s *Server) handleClosePosition(c *gin.Context) {
 	logger.Infof("✅ Position closed successfully: symbol=%s, side=%s, qty=%.6f, result=%v", req.Symbol, req.Side, posQty, result)
 
 	// Record order to database (for chart markers and history)
-	s.recordClosePositionOrder(traderID, exchangeCfg.ID, exchangeCfg.ExchangeType, req.Symbol, req.Side, posQty, entryPrice, result)
+	if exchangeCfg.ExchangeType == "bitget_paper" {
+		// Bitget Paper has no OrderSync: record through the AutoTrader so the order, fill and
+		// position close are written exactly like an AI-initiated close.
+		if at, atErr := s.traderManager.GetTrader(traderID); atErr == nil {
+			at.RecordManualClose(req.Symbol, req.Side, posQty, entryPrice, result)
+		}
+	} else {
+		s.recordClosePositionOrder(traderID, exchangeCfg.ID, exchangeCfg.ExchangeType, req.Symbol, req.Side, posQty, entryPrice, result)
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Position closed successfully",
@@ -1850,7 +1883,7 @@ func (s *Server) handleUpdateExchangeConfigs(c *gin.Context) {
 
 // CreateExchangeRequest request structure for creating a new exchange account
 type CreateExchangeRequest struct {
-	ExchangeType            string `json:"exchange_type" binding:"required"` // "binance", "bybit", "okx", "hyperliquid", "aster", "lighter"
+	ExchangeType            string `json:"exchange_type" binding:"required"` // "binance", "bybit", "okx", "bitget", "bitget_paper", "hyperliquid", "aster", "lighter"
 	AccountName             string `json:"account_name"`                     // User-defined account name
 	Enabled                 bool   `json:"enabled"`
 	APIKey                  string `json:"api_key"`
@@ -1920,7 +1953,7 @@ func (s *Server) handleCreateExchange(c *gin.Context) {
 
 	// Validate exchange type
 	validTypes := map[string]bool{
-		"binance": true, "bybit": true, "okx": true, "bitget": true,
+		"binance": true, "bybit": true, "okx": true, "bitget": true, "bitget_paper": true,
 		"hyperliquid": true, "aster": true, "lighter": true,
 	}
 	if !validTypes[req.ExchangeType] {
@@ -2230,9 +2263,9 @@ func (s *Server) handleTrades(c *gin.Context) {
 		limit = l
 	}
 
-	// Normalize symbol (add USDT suffix if not present)
+	// Normalize symbol (add USDT suffix if not present; Bitget keeps TradFi names like NVDAUSDT)
 	if symbol != "" {
-		symbol = market.Normalize(symbol)
+		symbol = normalizeSymbolForExchange(symbol, trader.GetExchange())
 	}
 
 	// Get trades from store
@@ -2286,9 +2319,9 @@ func (s *Server) handleOrders(c *gin.Context) {
 		limit = l
 	}
 
-	// Normalize symbol (add USDT suffix if not present)
+	// Normalize symbol (add USDT suffix if not present; Bitget keeps TradFi names like NVDAUSDT)
 	if symbol != "" {
-		symbol = market.Normalize(symbol)
+		symbol = normalizeSymbolForExchange(symbol, trader.GetExchange())
 	}
 
 	// Get orders from store
@@ -2366,8 +2399,8 @@ func (s *Server) handleOpenOrders(c *gin.Context) {
 		return
 	}
 
-	// Normalize symbol
-	symbol = market.Normalize(symbol)
+	// Normalize symbol (Bitget keeps TradFi names like NVDAUSDT)
+	symbol = normalizeSymbolForExchange(symbol, trader.GetExchange())
 
 	// Get open orders from exchange
 	openOrders, err := trader.GetOpenOrders(symbol)
@@ -2427,6 +2460,20 @@ func (s *Server) handleKlines(c *gin.Context) {
 			SafeInternalError(c, "Get klines from Hyperliquid", err)
 			return
 		}
+	case "bitget", "bitget_paper":
+		// Bitget public candles: same venue the (paper) trader executes on, and the only
+		// source that has TradFi perps such as NVDAUSDT / XAUUSDT. Intervals Bitget does not
+		// offer fall back to CoinAnk.
+		symbol = normalizeSymbolForExchange(symbol, exchangeLower)
+		klines, err = getKlinesFromBitget(symbol, interval, limit)
+		if err != nil {
+			logger.Warnf("⚠️ Bitget klines failed (%v), falling back to CoinAnk", err)
+			klines, err = s.getKlinesFromCoinank(symbol, interval, "bitget", limit)
+			if err != nil {
+				SafeInternalError(c, "Get klines from Bitget", err)
+				return
+			}
+		}
 	default:
 		// Crypto exchanges via CoinAnk
 		symbol = market.Normalize(symbol)
@@ -2438,6 +2485,42 @@ func (s *Server) handleKlines(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, klines)
+}
+
+// normalizeSymbolForExchange normalizes a user-supplied symbol for an exchange type. Bitget
+// (live and paper) keeps XXXUSDT contract names; everything else uses the default mapping.
+func normalizeSymbolForExchange(symbol, exchange string) string {
+	switch strings.ToLower(exchange) {
+	case "bitget", "bitget_paper":
+		return market.NormalizeForSource(symbol, market.SourceBitget)
+	}
+	return market.Normalize(symbol)
+}
+
+// getKlinesFromBitget fetches klines from Bitget's public USDT-futures candles endpoint.
+func getKlinesFromBitget(symbol, interval string, limit int) ([]market.Kline, error) {
+	candles, err := bitget.GetCandles(symbol, interval, limit)
+	if err != nil {
+		return nil, err
+	}
+	dur, durErr := market.TFDuration(interval)
+	klines := make([]market.Kline, len(candles))
+	for i, c := range candles {
+		k := market.Kline{
+			OpenTime:    c.OpenTime,
+			Open:        c.Open,
+			High:        c.High,
+			Low:         c.Low,
+			Close:       c.Close,
+			Volume:      c.Volume,
+			QuoteVolume: c.QuoteVolume,
+		}
+		if durErr == nil {
+			k.CloseTime = c.OpenTime + dur.Milliseconds() - 1
+		}
+		klines[i] = k
+	}
+	return klines, nil
 }
 
 // getKlinesFromCoinank fetches kline data from coinank free/open API for multiple exchanges
@@ -3277,6 +3360,8 @@ func (s *Server) handleGetSupportedExchanges(c *gin.Context) {
 		{ExchangeType: "binance", Name: "Binance Futures", Type: "cex"},
 		{ExchangeType: "bybit", Name: "Bybit Futures", Type: "cex"},
 		{ExchangeType: "okx", Name: "OKX Futures", Type: "cex"},
+		{ExchangeType: "bitget", Name: "Bitget Futures", Type: "cex"},
+		{ExchangeType: "bitget_paper", Name: "Bitget Paper", Type: "cex"},
 		{ExchangeType: "hyperliquid", Name: "Hyperliquid", Type: "dex"},
 		{ExchangeType: "aster", Name: "Aster DEX", Type: "dex"},
 		{ExchangeType: "lighter", Name: "LIGHTER DEX", Type: "dex"},

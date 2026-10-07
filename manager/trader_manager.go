@@ -691,6 +691,9 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 		traderConfig.BitgetSecretKey = string(exchangeCfg.SecretKey)
 		traderConfig.BitgetPassphrase = string(exchangeCfg.Passphrase)
 		traderConfig.BitgetTestnet = exchangeCfg.Testnet
+	case "bitget_paper":
+		// Local paper trading on live Bitget public data: no API keys, nothing to copy.
+		// The starting balance comes from the trader's InitialBalance (default 10000).
 	case "hyperliquid":
 		traderConfig.HyperliquidPrivateKey = string(exchangeCfg.APIKey)
 		traderConfig.HyperliquidWalletAddr = exchangeCfg.HyperliquidWalletAddr
