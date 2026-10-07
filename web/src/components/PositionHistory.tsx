@@ -3,6 +3,7 @@ import { api } from '../lib/api'
 import { useLanguage } from '../contexts/LanguageContext'
 import { t } from '../i18n/translations'
 import { MetricTooltip } from './MetricTooltip'
+import { CloseReasonBadge } from './CloseReasonBadge'
 import type {
   HistoricalPosition,
   TraderStats,
@@ -236,7 +237,7 @@ function DirectionStatsCard({ stat, language }: { stat: DirectionStats; language
 }
 
 // Position Row Component
-function PositionRow({ position }: { position: HistoricalPosition }) {
+function PositionRow({ position, language }: { position: HistoricalPosition; language: 'en' | 'zh' }) {
   const side = position.side || ''
   const isLong = side.toUpperCase() === 'LONG'
   const realizedPnl = position.realized_pnl || 0
@@ -330,6 +331,11 @@ function PositionRow({ position }: { position: HistoricalPosition }) {
       {/* Duration */}
       <td className="py-3 px-4 text-center text-sm" style={{ color: '#848E9C' }}>
         {formatDuration(holdingMinutes)}
+      </td>
+
+      {/* Close Reason */}
+      <td className="py-3 px-4 text-center">
+        <CloseReasonBadge reason={position.close_reason} language={language} />
       </td>
 
       {/* Exit Time */}
@@ -794,6 +800,12 @@ export function PositionHistory({ traderId }: PositionHistoryProps) {
                   {t('positionHistory.duration', language)}
                 </th>
                 <th
+                  className="py-3 px-4 text-center text-xs font-semibold uppercase tracking-wider"
+                  style={{ color: '#848E9C' }}
+                >
+                  {t('positionHistory.closeReason', language)}
+                </th>
+                <th
                   className="py-3 px-4 text-right text-xs font-semibold uppercase tracking-wider"
                   style={{ color: '#848E9C' }}
                 >
@@ -803,7 +815,7 @@ export function PositionHistory({ traderId }: PositionHistoryProps) {
             </thead>
             <tbody>
               {filteredPositions.map((position) => (
-                <PositionRow key={position.id} position={position} />
+                <PositionRow key={position.id} position={position} language={language} />
               ))}
             </tbody>
           </table>

@@ -1853,7 +1853,7 @@ func (at *AutoTrader) emergencyClosePosition(symbol, side string) error {
 // OrderSync (Bitget Paper); all other exchanges are synced from exchange trade history.
 func (at *AutoTrader) recordEmergencyCloseIfUnsynced(symbol, side string, order map[string]interface{}) {
 	if _, ok := at.trader.(*BitgetPaperTrader); ok {
-		at.RecordManualClose(symbol, side, 0, 0, order)
+		at.recordCloseWithReason(symbol, side, 0, 0, order, store.CloseReasonDrawdown)
 	}
 }
 
@@ -1900,6 +1900,13 @@ func (at *AutoTrader) ClearPeakPnLCache(symbol, side string) {
 // action: open_long, open_short, close_long, close_short
 // entryPrice: entry price when closing (0 when opening)
 func (at *AutoTrader) recordAndConfirmOrder(orderResult map[string]interface{}, symbol, action string, quantity float64, price float64, leverage int, entryPrice float64) {
+	at.recordAndConfirmOrderWithReason(orderResult, symbol, action, quantity, price, leverage, entryPrice, store.CloseReasonAI)
+}
+
+// recordAndConfirmOrderWithReason is recordAndConfirmOrder for closes whose cause is not the AI
+// decision cycle (manual close, drawdown monitor): closeReason is stored as the position's
+// close_reason when the order closes it.
+func (at *AutoTrader) recordAndConfirmOrderWithReason(orderResult map[string]interface{}, symbol, action string, quantity float64, price float64, leverage int, entryPrice float64, closeReason string) {
 	if at.store == nil {
 		return
 	}
@@ -2000,7 +2007,7 @@ func (at *AutoTrader) recordAndConfirmOrder(orderResult map[string]interface{}, 
 		orderID, action, actualPrice, actualQty, fee)
 
 	// Record position change with actual fill data (use normalized symbol)
-	at.recordPositionChange(orderID, normalizedSymbolForPosition, positionSide, action, actualQty, actualPrice, leverage, entryPrice, fee)
+	at.recordPositionChange(orderID, normalizedSymbolForPosition, positionSide, action, actualQty, actualPrice, leverage, entryPrice, fee, closeReason)
 
 	// Send anonymous trade statistics for experience improvement (async, non-blocking)
 	// This helps us understand overall product usage across all deployments
@@ -2015,8 +2022,9 @@ func (at *AutoTrader) recordAndConfirmOrder(orderResult map[string]interface{}, 
 	})
 }
 
-// recordPositionChange records position change (create record on open, update record on close)
-func (at *AutoTrader) recordPositionChange(orderID, symbol, side, action string, quantity, price float64, leverage int, entryPrice float64, fee float64) {
+// recordPositionChange records position change (create record on open, update record on close).
+// closeReason (store.CloseReason*) is stored as close_reason when a close fully closes the position.
+func (at *AutoTrader) recordPositionChange(orderID, symbol, side, action string, quantity, price float64, leverage int, entryPrice float64, fee float64, closeReason string) {
 	if at.store == nil {
 		return
 	}
@@ -2052,11 +2060,11 @@ func (at *AutoTrader) recordPositionChange(orderID, symbol, side, action string,
 		// 1. If open position exists: close it properly
 		// 2. If no open position (e.g., table cleared): create a closed position record
 		posBuilder := store.NewPositionBuilder(at.store.Position())
-		if err := posBuilder.ProcessTrade(
+		if err := posBuilder.ProcessTradeWithReason(
 			at.id, at.exchangeID, at.exchange,
 			symbol, side, action,
 			quantity, price, fee, 0, // realizedPnL will be calculated
-			time.Now().UTC().UnixMilli(), orderID,
+			time.Now().UTC().UnixMilli(), orderID, closeReason,
 		); err != nil {
 			logger.Infof("  ⚠️ Failed to process close position: %v", err)
 		} else {
@@ -2068,12 +2076,18 @@ func (at *AutoTrader) recordPositionChange(orderID, symbol, side, action string,
 // RecordManualClose records a close executed outside the AI cycle (the one-click close API)
 // for exchanges that have no OrderSync, using the same bookkeeping as an AI close.
 func (at *AutoTrader) RecordManualClose(symbol, side string, quantity, entryPrice float64, order map[string]interface{}) {
+	at.recordCloseWithReason(symbol, side, quantity, entryPrice, order, store.CloseReasonManual)
+}
+
+// recordCloseWithReason records a close executed outside the AI cycle with the given
+// close_reason (store.CloseReason*).
+func (at *AutoTrader) recordCloseWithReason(symbol, side string, quantity, entryPrice float64, order map[string]interface{}, closeReason string) {
 	action := "close_short"
 	if strings.EqualFold(side, "long") {
 		action = "close_long"
 	}
 	price, _ := order["avgPrice"].(float64)
-	at.recordAndConfirmOrder(order, symbol, action, quantity, price, 0, entryPrice)
+	at.recordAndConfirmOrderWithReason(order, symbol, action, quantity, price, 0, entryPrice, closeReason)
 }
 
 // recordPaperSystemFill persists a fill the Bitget Paper matcher produced on its own
@@ -2093,12 +2107,12 @@ func (at *AutoTrader) recordPaperSystemFill(f PaperFill) {
 		logger.Infof("  ⚠️ Failed to update paper %s order status: %v", f.Reason, err)
 	}
 	at.recordOrderFill(orderRecord.ID, f.OrderID, f.Symbol, f.Action, f.Price, f.Quantity, f.Fee)
-	at.recordPositionChange(f.OrderID, at.normalizeSymbol(f.Symbol), f.PositionSide, f.Action, f.Quantity, f.Price, f.Leverage, f.EntryPrice, f.Fee)
+	at.recordPositionChange(f.OrderID, at.normalizeSymbol(f.Symbol), f.PositionSide, f.Action, f.Quantity, f.Price, f.Leverage, f.EntryPrice, f.Fee, f.Reason)
 	logger.Infof("  📝 [%s] Paper %s recorded: %s %s qty=%.6f @ %.6f pnl=%.4f", at.name, f.Reason, f.Symbol, f.PositionSide, f.Quantity, f.Price, f.RealizedPnL)
 }
 
 // paperStateLostReason is the close_reason of database positions closed by reconcilePaperPositions.
-const paperStateLostReason = "paper_state_lost"
+const paperStateLostReason = store.CloseReasonPaperStateLost
 
 // reconcilePaperPositions closes every OPEN database position of this trader that the paper
 // account does not hold (matched by symbol and side). This happens when the paper account was
