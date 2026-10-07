@@ -57,6 +57,9 @@ func (c *Client) GetNetFlowRanking(duration string, limit int) (*NetFlowRankingD
 
 	// Fetch institution futures top (inflow)
 	positions, timeRange, err := c.fetchNetFlowRanking("top", duration, limit, "institution", "future")
+	if IsUnavailable(err) {
+		return nil, err // breaker open: callers log this at debug level
+	}
 	if err != nil {
 		log.Printf("⚠️  Failed to fetch institution future inflow ranking: %v", err)
 	} else {
@@ -66,6 +69,9 @@ func (c *Client) GetNetFlowRanking(duration string, limit int) (*NetFlowRankingD
 
 	// Fetch institution futures low (outflow)
 	positions, _, err = c.fetchNetFlowRanking("low", duration, limit, "institution", "future")
+	if IsUnavailable(err) {
+		return nil, err // breaker open: callers log this at debug level
+	}
 	if err != nil {
 		log.Printf("⚠️  Failed to fetch institution future outflow ranking: %v", err)
 	} else {
@@ -74,6 +80,9 @@ func (c *Client) GetNetFlowRanking(duration string, limit int) (*NetFlowRankingD
 
 	// Fetch personal futures top (retail inflow)
 	positions, _, err = c.fetchNetFlowRanking("top", duration, limit, "personal", "future")
+	if IsUnavailable(err) {
+		return nil, err // breaker open: callers log this at debug level
+	}
 	if err != nil {
 		log.Printf("⚠️  Failed to fetch personal future inflow ranking: %v", err)
 	} else {
@@ -82,6 +91,9 @@ func (c *Client) GetNetFlowRanking(duration string, limit int) (*NetFlowRankingD
 
 	// Fetch personal futures low (retail outflow)
 	positions, _, err = c.fetchNetFlowRanking("low", duration, limit, "personal", "future")
+	if IsUnavailable(err) {
+		return nil, err // breaker open: callers log this at debug level
+	}
 	if err != nil {
 		log.Printf("⚠️  Failed to fetch personal future outflow ranking: %v", err)
 	} else {

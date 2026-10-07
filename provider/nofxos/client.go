@@ -85,13 +85,27 @@ func (c *Client) GetAuthKey() string {
 	return c.AuthKey
 }
 
-// doRequest performs an HTTP GET request with authentication
+// httpGet performs the outbound request. It is a seam so tests can reach a
+// loopback httptest server (security.SafeGet blocks private addresses).
+var httpGet = security.SafeGet
+
+// doRequest performs an HTTP GET request with authentication.
+//
+// It is guarded by a per-auth-key circuit breaker (see breaker.go): while the
+// breaker is open it returns an error matching ErrUnavailable without any HTTP
+// traffic, and a response that shows the upstream rejected the key (HTTP
+// 401/403, or a success=false body saying the key is deprecated / invalid /
+// expired) opens it.
 func (c *Client) doRequest(endpoint string) ([]byte, error) {
 	c.mu.RLock()
 	baseURL := c.BaseURL
 	authKey := c.AuthKey
 	timeout := c.Timeout
 	c.mu.RUnlock()
+
+	if err := checkBreaker(authKey); err != nil {
+		return nil, err
+	}
 
 	url := baseURL + endpoint
 	if !strings.Contains(url, "auth=") {
@@ -102,7 +116,7 @@ func (c *Client) doRequest(endpoint string) ([]byte, error) {
 		}
 	}
 
-	resp, err := security.SafeGet(url, timeout)
+	resp, err := httpGet(url, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -111,6 +125,13 @@ func (c *Client) doRequest(endpoint string) ([]byte, error) {
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
+	}
+
+	if msg, rejected := keyRejection(resp.StatusCode, body); rejected {
+		return body, tripBreaker(authKey, msg, &APIError{
+			StatusCode: resp.StatusCode,
+			Message:    string(body),
+		})
 	}
 
 	if resp.StatusCode != http.StatusOK {

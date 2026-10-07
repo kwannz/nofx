@@ -62,6 +62,9 @@ func (c *Client) GetOIRanking(duration string, limit int) (*OIRankingData, error
 
 	// Fetch top ranking (OI increase)
 	topPositions, timeRange, err := c.fetchOIRanking("top", duration, limit)
+	if IsUnavailable(err) {
+		return nil, err // breaker open: nothing to fetch, callers log this at debug level
+	}
 	if err != nil {
 		log.Printf("⚠️  Failed to fetch OI top ranking: %v", err)
 	} else {
@@ -71,6 +74,9 @@ func (c *Client) GetOIRanking(duration string, limit int) (*OIRankingData, error
 
 	// Fetch low ranking (OI decrease)
 	lowPositions, _, err := c.fetchOIRanking("low", duration, limit)
+	if IsUnavailable(err) {
+		return nil, err
+	}
 	if err != nil {
 		log.Printf("⚠️  Failed to fetch OI low ranking: %v", err)
 	} else {

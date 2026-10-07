@@ -32,6 +32,11 @@ type AI500Response struct {
 
 // GetAI500List retrieves AI500 coin list with retry mechanism
 func (c *Client) GetAI500List() ([]CoinData, error) {
+	// Rejected key (breaker open): fail fast, no retries, no log noise.
+	if err := c.Available(); err != nil {
+		return nil, err
+	}
+
 	maxRetries := 3
 	var lastErr error
 
@@ -47,6 +52,10 @@ func (c *Client) GetAI500List() ([]CoinData, error) {
 				log.Printf("✓ Retry attempt %d succeeded", attempt)
 			}
 			return coins, nil
+		}
+
+		if IsUnavailable(err) {
+			return nil, err // the key was just rejected: retrying cannot help
 		}
 
 		lastErr = err
