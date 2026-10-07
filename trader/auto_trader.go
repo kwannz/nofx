@@ -1419,6 +1419,9 @@ func (at *AutoTrader) SetShowInCompetition(show bool) {
 // SetCustomPrompt sets custom trading strategy prompt
 func (at *AutoTrader) SetCustomPrompt(prompt string) {
 	at.customPrompt = prompt
+	if at.strategyEngine != nil {
+		at.strategyEngine.SetTraderPrompt(prompt)
+	}
 }
 
 // SetOverrideBasePrompt sets whether to override base prompt

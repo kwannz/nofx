@@ -212,3 +212,16 @@ func TestDropUntradableOpensKeepsOtherDecisions(t *testing.T) {
 		t.Fatalf("nil env must not drop decisions")
 	}
 }
+
+func TestBuildSystemPromptIncludesTraderPrompt(t *testing.T) {
+	cfg := store.GetDefaultStrategyConfig("en")
+	e := NewStrategyEngine(&cfg)
+	if strings.Contains(e.BuildSystemPrompt(10000, "balanced"), "Trader-Specific Instructions") {
+		t.Fatal("no trader prompt set: section must be absent")
+	}
+	e.SetTraderPrompt("  keep at most 2 positions  ")
+	sp := e.BuildSystemPrompt(10000, "balanced")
+	if !strings.Contains(sp, "Trader-Specific Instructions") || !strings.Contains(sp, "keep at most 2 positions") {
+		t.Fatal("trader prompt must be included in the system prompt")
+	}
+}

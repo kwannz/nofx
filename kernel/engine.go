@@ -194,6 +194,13 @@ type StrategyEngine struct {
 	config       *store.StrategyConfig
 	nofxosClient *nofxos.Client
 	marketSource market.Source // where market data comes from (default: legacy routing)
+	traderPrompt string        // per-trader custom prompt (appended after the strategy prompt)
+}
+
+// SetTraderPrompt sets the per-trader custom prompt. It supplements the strategy's
+// own CustomPrompt so trader-level instructions are not silently dropped.
+func (e *StrategyEngine) SetTraderPrompt(prompt string) {
+	e.traderPrompt = strings.TrimSpace(prompt)
 }
 
 // NewStrategyEngine creates strategy execution engine
@@ -998,6 +1005,13 @@ func (e *StrategyEngine) BuildSystemPrompt(accountEquity float64, variant string
 		sb.WriteString(e.config.CustomPrompt)
 		sb.WriteString("\n\n")
 		sb.WriteString("Note: The above personalized strategy is a supplement to the basic rules and cannot violate the basic risk control principles.\n")
+	}
+
+	// 9. Per-trader custom prompt
+	if e.traderPrompt != "" {
+		sb.WriteString("\n# 📌 Trader-Specific Instructions\n\n")
+		sb.WriteString(e.traderPrompt)
+		sb.WriteString("\n\nNote: These trader-specific instructions supplement the rules above and cannot violate the basic risk control principles.\n")
 	}
 
 	return sb.String()
