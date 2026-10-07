@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"nofx/internal/testutil"
 )
 
 func TestGetCandles_BTC(t *testing.T) {
-	requireLiveTests(t)
+	testutil.RequireLive(t)
 	client := NewClient()
 
 	candles, err := client.GetCandles(context.TODO(), "BTC", "1d", 5)
@@ -37,7 +39,7 @@ func TestGetCandles_BTC(t *testing.T) {
 }
 
 func TestGetCandles_TSLA(t *testing.T) {
-	requireLiveTests(t)
+	testutil.RequireLive(t)
 	client := NewClient()
 
 	// 测试股票永续合约 - 使用 xyz dex
@@ -66,7 +68,7 @@ func TestGetCandles_TSLA(t *testing.T) {
 }
 
 func TestGetCandles_StockPerps(t *testing.T) {
-	requireLiveTests(t)
+	testutil.RequireLive(t)
 	client := NewClient()
 
 	// 测试多个股票永续合约 (xyz dex)
@@ -93,7 +95,7 @@ func TestGetCandles_StockPerps(t *testing.T) {
 }
 
 func TestGetAllMids(t *testing.T) {
-	requireLiveTests(t)
+	testutil.RequireLive(t)
 	client := NewClient()
 
 	mids, err := client.GetAllMids(context.TODO())
@@ -117,7 +119,7 @@ func TestGetAllMids(t *testing.T) {
 }
 
 func TestGetAllMidsXYZ(t *testing.T) {
-	requireLiveTests(t)
+	testutil.RequireLive(t)
 	client := NewClient()
 
 	mids, err := client.GetAllMidsXYZ(context.TODO())
@@ -136,7 +138,7 @@ func TestGetAllMidsXYZ(t *testing.T) {
 }
 
 func TestGetMeta(t *testing.T) {
-	requireLiveTests(t)
+	testutil.RequireLive(t)
 	client := NewClient()
 
 	meta, err := client.GetMeta(context.TODO())

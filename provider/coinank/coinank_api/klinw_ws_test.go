@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"nofx/internal/testutil"
 	"nofx/provider/coinank/coinank_enum"
 	"testing"
 	"time"
 )
 
 func TestKlineWs(t *testing.T) {
-	requireLiveTests(t)
+	testutil.RequireLive(t)
 	ctx := context.TODO()
 	ws, err := WsConn(ctx, true, true)
 	if err != nil {

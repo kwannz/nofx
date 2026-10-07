@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"nofx/internal/testutil"
 	"nofx/market"
 	"nofx/provider/coinank"
 	"nofx/provider/coinank/coinank_api"
@@ -202,7 +203,7 @@ func generateTestKlines(count int, basePrice float64) []market.Kline {
 
 // TestQwenIndicatorCalculation 测试 AI 计算技术指标
 func TestQwenIndicatorCalculation(t *testing.T) {
-	requireLiveTests(t)
+	testutil.RequireLive(t)
 	agent := NewQwenAgent(QwenAppID, QwenAPIKey)
 	ctx := context.Background()
 
@@ -290,7 +291,7 @@ func TestQwenIndicatorCalculation(t *testing.T) {
 
 // TestQwenIndicatorWithRealKlines 使用真实 K 线测试
 func TestQwenIndicatorWithRealKlines(t *testing.T) {
-	requireLiveTests(t)
+	testutil.RequireLive(t)
 	// 尝试获取真实 K 线数据
 	client := market.NewAPIClient()
 	klines, err := client.GetKlines("BTC", "1h", 30)
@@ -343,7 +344,7 @@ func TestQwenIndicatorWithRealKlines(t *testing.T) {
 
 // TestQwenIndicatorMultiTimeframe 测试多个时间周期
 func TestQwenIndicatorMultiTimeframe(t *testing.T) {
-	requireLiveTests(t)
+	testutil.RequireLive(t)
 	agent := NewQwenAgent(QwenAppID, QwenAPIKey)
 	ctx := context.Background()
 
@@ -420,7 +421,7 @@ func buildSimpleIndicatorPrompt(klines []market.Kline) string {
 
 // TestQwenIndicatorAccuracy 精度测试：使用简单数据验证算法
 func TestQwenIndicatorAccuracy(t *testing.T) {
-	requireLiveTests(t)
+	testutil.RequireLive(t)
 	agent := NewQwenAgent(QwenAppID, QwenAPIKey)
 	ctx := context.Background()
 
@@ -522,7 +523,7 @@ func coinankKlinesToMarket(klines []coinank.KlineResult) []market.Kline {
 
 // TestQwenETHMultiTimeframe 使用 Coinank 免费 API 获取真实 ETH 数据测试多周期指标
 func TestQwenETHMultiTimeframe(t *testing.T) {
-	requireLiveTests(t)
+	testutil.RequireLive(t)
 	ctx := context.Background()
 	agent := NewQwenAgent(QwenAppID, QwenAPIKey)
 
@@ -635,7 +636,7 @@ func TestQwenETHMultiTimeframe(t *testing.T) {
 
 // TestQwenETHIndicatorComparison ETH 指标对比：使用 Coinank 免费 API + Qwen 标准 API
 func TestQwenETHIndicatorComparison(t *testing.T) {
-	requireLiveTests(t)
+	testutil.RequireLive(t)
 	ctx := context.Background()
 	agent := NewQwenAgent(QwenAppID, QwenAPIKey)
 

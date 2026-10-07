@@ -3,14 +3,14 @@ package trader
 import (
 	"testing"
 	"time"
+
+	"nofx/internal/testutil"
 )
 
 // TestPaperLiveSmoke trades a tiny BTCUSDT long against the REAL Bitget public API
-// (no keys, no real orders). Skipped under -short.
+// (no keys, no real orders). Skipped unless NOFX_LIVE_TESTS=1.
 func TestPaperLiveSmoke(t *testing.T) {
-	if testing.Short() {
-		t.Skip("live Bitget smoke test skipped in -short mode")
-	}
+	testutil.RequireLive(t)
 	p := NewBitgetPaperTrader(1000)
 	defer p.Stop()
 

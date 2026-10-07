@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"nofx/internal/testutil"
 )
 
 // testXyzDexAsset is a local copy of testXyzDexAsset for testing
@@ -27,9 +29,7 @@ type testXyzDexMeta struct {
 
 // TestXyzDexMetaFetch tests fetching xyz dex meta from Hyperliquid API
 func TestXyzDexMetaFetch(t *testing.T) {
-	if os.Getenv("NOFX_LIVE_TESTS") != "1" {
-		t.Skip("live Hyperliquid API test: set NOFX_LIVE_TESTS=1 to run")
-	}
+	testutil.RequireLive(t)
 	reqBody := map[string]string{
 		"type": "meta",
 		"dex":  "xyz",
@@ -95,9 +95,7 @@ func TestXyzDexMetaFetch(t *testing.T) {
 
 // TestXyzDexPriceFetch tests fetching xyz dex prices from Hyperliquid API
 func TestXyzDexPriceFetch(t *testing.T) {
-	if os.Getenv("NOFX_LIVE_TESTS") != "1" {
-		t.Skip("live Hyperliquid API test: set NOFX_LIVE_TESTS=1 to run")
-	}
+	testutil.RequireLive(t)
 	reqBody := map[string]string{
 		"type": "allMids",
 		"dex":  "xyz",
@@ -157,9 +155,7 @@ func TestXyzDexPriceFetch(t *testing.T) {
 
 // TestXyzAssetIndexLookup tests the asset index lookup for xyz dex assets
 func TestXyzAssetIndexLookup(t *testing.T) {
-	if os.Getenv("NOFX_LIVE_TESTS") != "1" {
-		t.Skip("live Hyperliquid API test: set NOFX_LIVE_TESTS=1 to run")
-	}
+	testutil.RequireLive(t)
 	// Fetch xyz meta
 	reqBody := map[string]string{
 		"type": "meta",
@@ -218,9 +214,7 @@ func TestXyzAssetIndexLookup(t *testing.T) {
 
 // TestXyzSzDecimalsLookup tests the szDecimals lookup for different xyz assets
 func TestXyzSzDecimalsLookup(t *testing.T) {
-	if os.Getenv("NOFX_LIVE_TESTS") != "1" {
-		t.Skip("live Hyperliquid API test: set NOFX_LIVE_TESTS=1 to run")
-	}
+	testutil.RequireLive(t)
 	reqBody := map[string]string{
 		"type": "meta",
 		"dex":  "xyz",
@@ -301,9 +295,7 @@ func TestXyzOrderParameters(t *testing.T) {
 // Formula: 100000 + perp_dex_index * 10000 + meta_index
 // For xyz dex: perp_dex_index = 1, so asset_index = 110000 + meta_index
 func TestXyzAssetIndexCalculation(t *testing.T) {
-	if os.Getenv("NOFX_LIVE_TESTS") != "1" {
-		t.Skip("live Hyperliquid API test: set NOFX_LIVE_TESTS=1 to run")
-	}
+	testutil.RequireLive(t)
 	reqBody := map[string]string{
 		"type": "meta",
 		"dex":  "xyz",
@@ -411,9 +403,7 @@ func TestConvertSymbolToHyperliquidXyz(t *testing.T) {
 
 // TestXyzDexOrderFlow tests the complete order flow (without actually placing an order)
 func TestXyzDexOrderFlow(t *testing.T) {
-	if os.Getenv("NOFX_LIVE_TESTS") != "1" {
-		t.Skip("live Hyperliquid API test: set NOFX_LIVE_TESTS=1 to run")
-	}
+	testutil.RequireLive(t)
 	t.Log("=== Testing xyz Dex Order Flow ===")
 
 	// Step 1: Fetch meta

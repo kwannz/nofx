@@ -109,10 +109,10 @@
 
 ## 实时冒烟测试
 
-仓库里有一个默认跳过（`-short`）的联网测试，会用真实 Bitget 公开行情开一笔约 10 USDT 名义价值的 BTCUSDT 多单、设置止盈止损、平仓并打印余额：
+仓库里有一个默认跳过的联网测试（需要设置 `NOFX_LIVE_TESTS=1` 才会运行，CI 不会运行它），会用真实 Bitget 公开行情开一笔约 10 USDT 名义价值的 BTCUSDT 多单、设置止盈止损、平仓并打印余额：
 
 ```bash
-go test -count=1 -v ./trader/ -run TestPaperLiveSmoke
+NOFX_LIVE_TESTS=1 go test -count=1 -v ./trader/ -run TestPaperLiveSmoke
 ```
 
 ## 使用 Bitget 官方 Demo（需要 Demo API Key）

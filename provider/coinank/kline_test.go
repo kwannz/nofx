@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"nofx/internal/testutil"
 	"nofx/provider/coinank/coinank_enum"
 	"testing"
 	"time"
 )
 
 func TestKline(t *testing.T) {
-	requireLiveTests(t)
+	testutil.RequireLive(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.Kline(context.TODO(), "BTCUSDT", coinank_enum.Binance, 0, time.Now().UnixMilli(), 10, coinank_enum.Hour1)
 	if err != nil {
@@ -24,7 +25,7 @@ func TestKline(t *testing.T) {
 }
 
 func TestKlineDaily(t *testing.T) {
-	requireLiveTests(t)
+	testutil.RequireLive(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.Kline(context.TODO(), "BTCUSDT", coinank_enum.Binance, 0, time.Now().UnixMilli(), 5, coinank_enum.Day1)
 	if err != nil {

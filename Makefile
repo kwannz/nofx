@@ -1,6 +1,6 @@
 # NOFX Makefile for testing and development
 
-.PHONY: help test test-backend test-frontend test-coverage clean
+.PHONY: help test test-backend test-frontend test-coverage test-live clean
 
 # Default target
 help:
@@ -11,6 +11,7 @@ help:
 	@echo "  make test-backend         - Run backend tests only"
 	@echo "  make test-frontend        - Run frontend tests only"
 	@echo "  make test-coverage        - Generate backend coverage report"
+	@echo "  make test-live            - Run live-network tests (sets NOFX_LIVE_TESTS=1, needs internet)"
 	@echo ""
 	@echo "Build:"
 	@echo "  make build                - Build backend binary"
@@ -48,6 +49,13 @@ test-coverage:
 	go test -coverprofile=coverage.out ./...
 	go tool cover -html=coverage.out -o coverage.html
 	@echo "✅ Backend coverage: coverage.html"
+
+# Live-network tests (real Bitget public API etc.). Skipped by default and in CI;
+# they only run when NOFX_LIVE_TESTS=1 is set.
+test-live:
+	@echo "🌐 Running live-network tests (NOFX_LIVE_TESTS=1)..."
+	NOFX_LIVE_TESTS=1 go test -count=1 -v ./provider/... ./market/ ./trader/ -run Live
+	@echo "✅ Live tests completed"
 
 # =============================================================================
 # Build
