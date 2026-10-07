@@ -191,10 +191,24 @@ type OIDeltaData struct {
 // StrategyEngine - Core Strategy Execution Engine
 // ============================================================================
 
+// nofxosAPI is the slice of *nofxos.Client the engine uses. It is an interface so tests can
+// count calls without network access.
+type nofxosAPI interface {
+	// Available returns nil when requests may be attempted, or an error matching
+	// nofxos.ErrUnavailable while the client's circuit breaker is open (no I/O).
+	Available() error
+	GetCoinData(symbol string, include string) (*nofxos.QuantData, error)
+	GetOIRanking(duration string, limit int) (*nofxos.OIRankingData, error)
+	GetNetFlowRanking(duration string, limit int) (*nofxos.NetFlowRankingData, error)
+	GetPriceRanking(durations string, limit int) (*nofxos.PriceRankingData, error)
+	GetOITopPositions() ([]nofxos.OIPosition, error)
+	GetTopRatedCoins(limit int) ([]string, error)
+}
+
 // StrategyEngine strategy execution engine
 type StrategyEngine struct {
 	config       *store.StrategyConfig
-	nofxosClient *nofxos.Client
+	nofxosClient nofxosAPI
 	marketSource market.Source // where market data comes from (default: legacy routing)
 
 	// Per-trader custom prompt. It is written from HTTP handlers (PUT /traders/:id/prompt) while
@@ -300,18 +314,7 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 
 	// Ensure OITopDataMap is initialized
 	if ctx.OITopDataMap == nil {
-		ctx.OITopDataMap = make(map[string]*OITopData)
-		oiPositions, err := engine.nofxosClient.GetOITopPositions()
-		if err == nil {
-			for _, pos := range oiPositions {
-				ctx.OITopDataMap[pos.Symbol] = &OITopData{
-					Rank:              pos.Rank,
-					OIDeltaPercent:    pos.OIDeltaPercent,
-					OIDeltaValue:      pos.OIDeltaValue,
-					PriceDeltaPercent: pos.PriceDeltaPercent,
-				}
-			}
-		}
+		ctx.OITopDataMap = engine.fetchOITopDataMap()
 	}
 
 	// 2. Build System Prompt using strategy engine
@@ -498,6 +501,13 @@ func (e *StrategyEngine) GetCandidateCoins() ([]CandidateCoin, error) {
 			return e.filterExcludedCoins(candidates), nil
 		}
 		coins, err := e.getOITopCoins(coinSource.OITopLimit)
+		if nofxos.IsUnavailable(err) {
+			// The NofxOS circuit breaker is open (rejected API key). Keep the pre-breaker
+			// behaviour: an empty candidate list, not an error, so the trading cycle still
+			// runs and the AI can keep managing open positions. The client already warned once.
+			logger.Debugf("NofxOS unavailable, no OI Top candidate coins: %v", err)
+			return e.filterExcludedCoins(nil), nil
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -506,7 +516,9 @@ func (e *StrategyEngine) GetCandidateCoins() ([]CandidateCoin, error) {
 	case "mixed":
 		if coinSource.UseAI500 {
 			poolCoins, err := e.getAI500Coins(coinSource.AI500Limit)
-			if err != nil {
+			if nofxos.IsUnavailable(err) {
+				logger.Debugf("NofxOS unavailable, skipping AI500 coins: %v", err)
+			} else if err != nil {
 				logger.Infof("⚠️  Failed to get AI500 coins: %v", err)
 			} else {
 				for _, coin := range poolCoins {
@@ -517,7 +529,9 @@ func (e *StrategyEngine) GetCandidateCoins() ([]CandidateCoin, error) {
 
 		if coinSource.UseOITop {
 			oiCoins, err := e.getOITopCoins(coinSource.OITopLimit)
-			if err != nil {
+			if nofxos.IsUnavailable(err) {
+				logger.Debugf("NofxOS unavailable, skipping OI Top coins: %v", err)
+			} else if err != nil {
 				logger.Infof("⚠️  Failed to get OI Top: %v", err)
 			} else {
 				for _, coin := range oiCoins {
@@ -704,9 +718,69 @@ func extractJSONPath(data interface{}, path string) interface{} {
 	return current
 }
 
+// skipMarketWideNofxosData reports whether market-wide NofxOS data (OI / NetFlow / price
+// rankings and the OI-top list) must not be fetched. That data describes the Binance crypto
+// market, so it is meaningless for a Bitget engine (which also trades TradFi perps).
+func (e *StrategyEngine) skipMarketWideNofxosData() bool {
+	return e.marketSource == market.SourceBitget
+}
+
+// nofxosUnavailable reports whether the NofxOS client is disabled (rejected API key, breaker
+// open) and logs that at debug level only; the breaker itself already warned once when it
+// tripped, so per-cycle callers stay quiet.
+func (e *StrategyEngine) nofxosUnavailable(what string) bool {
+	if err := e.nofxosClient.Available(); err != nil {
+		logger.Debugf("NofxOS unavailable, skipping %s: %v", what, err)
+		return true
+	}
+	return false
+}
+
+// logRankingError logs a failed market-wide ranking fetch: debug when the NofxOS breaker is
+// open (the client already warned once when it tripped), warning otherwise.
+func (e *StrategyEngine) logRankingError(what string, err error) {
+	if nofxos.IsUnavailable(err) {
+		logger.Debugf("NofxOS unavailable, skipping %s data: %v", what, err)
+		return
+	}
+	logger.Warnf("⚠️  Failed to fetch %s data: %v", what, err)
+}
+
+// fetchOITopDataMap builds the per-symbol OI-top lookup used by the prompt formatter. It is
+// best-effort: the result is always non-nil and empty when the data is skipped or unavailable.
+func (e *StrategyEngine) fetchOITopDataMap() map[string]*OITopData {
+	result := make(map[string]*OITopData)
+	if e.skipMarketWideNofxosData() || e.nofxosUnavailable("OI top positions") {
+		return result
+	}
+	oiPositions, err := e.nofxosClient.GetOITopPositions()
+	if err != nil {
+		if nofxos.IsUnavailable(err) {
+			logger.Debugf("NofxOS unavailable, no OI top positions: %v", err)
+		} else {
+			logger.Infof("⚠️  Failed to fetch OI top positions: %v", err)
+		}
+		return result
+	}
+	for _, pos := range oiPositions {
+		result[pos.Symbol] = &OITopData{
+			Rank:              pos.Rank,
+			OIDeltaPercent:    pos.OIDeltaPercent,
+			OIDeltaValue:      pos.OIDeltaValue,
+			PriceDeltaPercent: pos.PriceDeltaPercent,
+		}
+	}
+	return result
+}
+
 // FetchQuantData fetches quantitative data for a single coin
 func (e *StrategyEngine) FetchQuantData(symbol string) (*QuantData, error) {
 	if !e.config.Indicators.EnableQuantData {
+		return nil, nil
+	}
+
+	// NofxOS quant data only covers crypto; Bitget TradFi (stock/commodity/FX) perps have none.
+	if e.marketSource == market.SourceBitget && e.isNonCrypto(symbol) {
 		return nil, nil
 	}
 
@@ -785,9 +859,18 @@ func (e *StrategyEngine) FetchQuantDataBatch(symbols []string) map[string]*Quant
 		return result
 	}
 
+	if e.nofxosUnavailable("quantitative data") {
+		return result
+	}
+
 	for _, symbol := range symbols {
 		data, err := e.FetchQuantData(symbol)
 		if err != nil {
+			if nofxos.IsUnavailable(err) {
+				// The key was rejected during this batch: the remaining symbols would fail too.
+				logger.Debugf("NofxOS unavailable, abandoning quantitative data batch: %v", err)
+				break
+			}
 			logger.Infof("⚠️  Failed to fetch quantitative data for %s: %v", symbol, err)
 			continue
 		}
@@ -802,7 +885,7 @@ func (e *StrategyEngine) FetchQuantDataBatch(symbols []string) map[string]*Quant
 // FetchOIRankingData fetches market-wide OI ranking data
 func (e *StrategyEngine) FetchOIRankingData() *nofxos.OIRankingData {
 	indicators := e.config.Indicators
-	if !indicators.EnableOIRanking {
+	if !indicators.EnableOIRanking || e.skipMarketWideNofxosData() || e.nofxosUnavailable("OI ranking data") {
 		return nil
 	}
 
@@ -820,7 +903,7 @@ func (e *StrategyEngine) FetchOIRankingData() *nofxos.OIRankingData {
 
 	data, err := e.nofxosClient.GetOIRanking(duration, limit)
 	if err != nil {
-		logger.Warnf("⚠️  Failed to fetch OI ranking data: %v", err)
+		e.logRankingError("OI ranking", err)
 		return nil
 	}
 
@@ -833,7 +916,7 @@ func (e *StrategyEngine) FetchOIRankingData() *nofxos.OIRankingData {
 // FetchNetFlowRankingData fetches market-wide NetFlow ranking data
 func (e *StrategyEngine) FetchNetFlowRankingData() *nofxos.NetFlowRankingData {
 	indicators := e.config.Indicators
-	if !indicators.EnableNetFlowRanking {
+	if !indicators.EnableNetFlowRanking || e.skipMarketWideNofxosData() || e.nofxosUnavailable("NetFlow ranking data") {
 		return nil
 	}
 
@@ -851,7 +934,7 @@ func (e *StrategyEngine) FetchNetFlowRankingData() *nofxos.NetFlowRankingData {
 
 	data, err := e.nofxosClient.GetNetFlowRanking(duration, limit)
 	if err != nil {
-		logger.Warnf("⚠️  Failed to fetch NetFlow ranking data: %v", err)
+		e.logRankingError("NetFlow ranking", err)
 		return nil
 	}
 
@@ -865,7 +948,7 @@ func (e *StrategyEngine) FetchNetFlowRankingData() *nofxos.NetFlowRankingData {
 // FetchPriceRankingData fetches market-wide price ranking data (gainers/losers)
 func (e *StrategyEngine) FetchPriceRankingData() *nofxos.PriceRankingData {
 	indicators := e.config.Indicators
-	if !indicators.EnablePriceRanking {
+	if !indicators.EnablePriceRanking || e.skipMarketWideNofxosData() || e.nofxosUnavailable("Price ranking data") {
 		return nil
 	}
 
@@ -883,7 +966,7 @@ func (e *StrategyEngine) FetchPriceRankingData() *nofxos.PriceRankingData {
 
 	data, err := e.nofxosClient.GetPriceRanking(durations, limit)
 	if err != nil {
-		logger.Warnf("⚠️  Failed to fetch Price ranking data: %v", err)
+		e.logRankingError("Price ranking", err)
 		return nil
 	}
 

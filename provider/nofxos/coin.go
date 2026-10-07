@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"strings"
+
+	"nofx/logger"
 )
 
 // QuantData represents quantitative data for a single coin
@@ -89,6 +91,10 @@ func (c *Client) GetCoinDataBatch(symbols []string, include string) map[string]*
 
 	for _, symbol := range symbols {
 		data, err := c.GetCoinData(symbol, include)
+		if IsUnavailable(err) {
+			logger.Debugf("NofxOS unavailable, skipping coin data batch: %v", err)
+			break
+		}
 		if err != nil {
 			log.Printf("⚠️  Failed to fetch coin data for %s: %v", symbol, err)
 			continue
