@@ -411,6 +411,9 @@ func (at *AutoTrader) Run() error {
 	// Orders placed by this trader are recorded by recordAndConfirmOrder (not an OrderSync exchange).
 	if paperTrader, ok := at.trader.(*BitgetPaperTrader); ok {
 		paperTrader.SetSystemFillHandler(at.recordPaperSystemFill)
+		// Positions the database still shows as OPEN but the paper account no longer holds
+		// (account snapshot lost or never existed) would stay open forever: close them first.
+		at.reconcilePaperPositions(paperTrader)
 		paperTrader.Start()
 		logger.Infof("🔄 [%s] Bitget Paper matcher started (SL/TP, liquidation, funding)", at.name)
 	}
@@ -2077,6 +2080,73 @@ func (at *AutoTrader) recordPaperSystemFill(f PaperFill) {
 	at.recordOrderFill(orderRecord.ID, f.OrderID, f.Symbol, f.Action, f.Price, f.Quantity, f.Fee)
 	at.recordPositionChange(f.OrderID, at.normalizeSymbol(f.Symbol), f.PositionSide, f.Action, f.Quantity, f.Price, f.Leverage, f.EntryPrice, f.Fee)
 	logger.Infof("  📝 [%s] Paper %s recorded: %s %s qty=%.6f @ %.6f pnl=%.4f", at.name, f.Reason, f.Symbol, f.PositionSide, f.Quantity, f.Price, f.RealizedPnL)
+}
+
+// paperStateLostReason is the close_reason of database positions closed by reconcilePaperPositions.
+const paperStateLostReason = "paper_state_lost"
+
+// reconcilePaperPositions closes every OPEN database position of this trader that the paper
+// account does not hold (matched by symbol and side). This happens when the paper account was
+// lost (no or unreadable snapshot, e.g. positions recorded before snapshots existed): without it
+// the position would stay OPEN in the database forever while the exchange view has nothing.
+// The position is closed at the current mark price, price PnL on the remaining quantity is
+// booked, and no additional fee is charged. Only called for bitget_paper traders.
+func (at *AutoTrader) reconcilePaperPositions(paper *BitgetPaperTrader) {
+	if at.store == nil || paper == nil {
+		return
+	}
+	dbPositions, err := at.store.Position().GetOpenPositions(at.id)
+	if err != nil {
+		logger.Warnf("⚠️ [%s] Paper reconciliation skipped: cannot load open positions: %v", at.name, err)
+		return
+	}
+	paperPositions, err := paper.GetPositions()
+	if err != nil {
+		logger.Warnf("⚠️ [%s] Paper reconciliation skipped: cannot read paper positions: %v", at.name, err)
+		return
+	}
+
+	key := func(symbol, side string) string {
+		return at.normalizeSymbol(symbol) + "|" + strings.ToUpper(side)
+	}
+	held := make(map[string]bool, len(paperPositions))
+	for _, p := range paperPositions {
+		sym, _ := p["symbol"].(string)
+		side, _ := p["side"].(string)
+		held[key(sym, side)] = true
+	}
+	inDB := make(map[string]bool, len(dbPositions))
+	for _, pos := range dbPositions {
+		inDB[key(pos.Symbol, pos.Side)] = true
+	}
+	for k := range held {
+		if !inDB[k] {
+			logger.Warnf("⚠️ [%s] Paper account holds %s but the database has no OPEN record for it", at.name, k)
+		}
+	}
+
+	for _, pos := range dbPositions {
+		if held[key(pos.Symbol, pos.Side)] {
+			continue
+		}
+		mark, err := paper.GetMarketPrice(pos.Symbol)
+		if err != nil || mark <= 0 {
+			logger.Warnf("⚠️ [%s] Paper reconciliation: no mark price for %s (%v), closing at entry price %.6f", at.name, pos.Symbol, err, pos.EntryPrice)
+			mark = pos.EntryPrice
+		}
+		pnl := (mark - pos.EntryPrice) * pos.Quantity
+		if strings.EqualFold(pos.Side, "SHORT") {
+			pnl = -pnl
+		}
+		pnl = math.Round(pnl*100) / 100
+		nowMs := time.Now().UTC().UnixMilli()
+		if err := at.store.Position().ClosePositionFully(pos.ID, mark, paperStateLostReason, nowMs, pos.RealizedPnL+pnl, pos.Fee, paperStateLostReason); err != nil {
+			logger.Warnf("⚠️ [%s] Paper reconciliation: failed to close orphaned position #%d %s %s: %v", at.name, pos.ID, pos.Symbol, pos.Side, err)
+			continue
+		}
+		logger.Warnf("⚠️ [%s] Paper account has no %s %s position (state lost): closed database position #%d (qty %.6f, entry %.6f) at mark %.6f, pnl %.2f, close_reason=%s",
+			at.name, pos.Symbol, pos.Side, pos.ID, pos.Quantity, pos.EntryPrice, mark, pnl, paperStateLostReason)
+	}
 }
 
 // createOrderRecord creates an order record struct from order details

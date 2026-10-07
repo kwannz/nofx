@@ -37,7 +37,9 @@ import (
 //   - Funding settles at UTC boundaries aligned to the contract's fundInterval (8h ->
 //     00:00/08:00/16:00) using the CURRENT funding rate: longs pay when the rate is
 //     positive. The amount is added to / removed from the position margin.
-//   - State lives in memory only: restarting the process resets the account.
+//   - State is kept in memory and snapshotted to disk (JSON, atomic replace) after every
+//     mutation, keyed by trader ID (see bitget_paper_state.go). A restart restores balance,
+//     positions, SL/TP and history; AutoTrader.Run then reconciles the database positions.
 //
 // A background matcher goroutine (interval 5s) evaluates SL/TP, liquidation and funding.
 // It is started lazily when a position is opened (or explicitly via Start) and stopped by
@@ -53,21 +55,31 @@ type BitgetPaperTrader struct {
 
 	tickMu sync.Mutex // serialises Tick
 
-	mu         sync.Mutex // guards everything below
-	initial    float64
-	cash       float64 // free (unlocked) balance
-	positions  map[string]*paperPosition
-	leverage   map[string]int  // per-symbol leverage setting
-	crossMode  map[string]bool // per-symbol margin mode flag (informational)
-	fills      []*PaperFill
-	fillIndex  map[string]*PaperFill
-	closed     []ClosedPnLRecord
-	seq        uint64
-	lastMark   map[string]float64
-	markCache  map[string]paperMarkEntry
-	onSysFill  func(PaperFill)
-	stopCh     chan struct{}
-	matcherEnd chan struct{}
+	mu        sync.Mutex // guards everything below
+	initial   float64
+	cash      float64 // free (unlocked) balance
+	positions map[string]*paperPosition
+	leverage  map[string]int  // per-symbol leverage setting
+	crossMode map[string]bool // per-symbol margin mode flag (informational)
+	fills     []*PaperFill
+	fillIndex map[string]*PaperFill
+	closed    []ClosedPnLRecord
+	seq       uint64
+	realized  float64 // cumulative gross price PnL of closing fills
+	// lastFundingSlot is the most recent funding slot settled for any position (bookkeeping
+	// only: the per-position fundingSlot decides what is still due).
+	lastFundingSlot int64
+	dirty           bool // matcher changed state (funding) that still has to be persisted
+	lastMark        map[string]float64
+	markCache       map[string]paperMarkEntry
+	onSysFill       func(PaperFill)
+	stopCh          chan struct{}
+	matcherEnd      chan struct{}
+
+	// persistence (bitget_paper_state.go); statePath == "" means in-memory only
+	traderID      string
+	statePath     string
+	persistFailed bool
 }
 
 // paperPriceSource supplies live market data. Tests inject a fake.
@@ -295,11 +307,12 @@ func (t *BitgetPaperTrader) Stop() {
 	stop, end := t.stopCh, t.matcherEnd
 	t.stopCh, t.matcherEnd = nil, nil
 	t.mu.Unlock()
-	if stop == nil {
-		return
+	if stop != nil {
+		close(stop)
+		<-end
 	}
-	close(stop)
-	<-end
+	// State is persisted on every mutation; this only retries a write that failed earlier.
+	t.flushIfFailed()
 }
 
 // Close is an alias of Stop.
@@ -314,29 +327,43 @@ var (
 // (with initialBalance) on first use. The API reloads an AutoTrader on every start and
 // config update, so the account must outlive the AutoTrader instance or a Stop/Start would
 // silently reset balance and positions. An empty id returns an unregistered account.
+//
+// When a state directory is configured (SetPaperStateDir) the account is restored from the
+// trader's snapshot file if one exists, so it also survives a process restart; initialBalance
+// then only applies to accounts without a snapshot. Every later mutation is written back.
 func AcquireBitgetPaperTrader(traderID string, initialBalance float64) *BitgetPaperTrader {
+	return acquireBitgetPaperTrader(traderID, initialBalance, NewBitgetPaperTrader)
+}
+
+// acquireBitgetPaperTrader is AcquireBitgetPaperTrader with an injectable constructor (tests
+// use a fake price source).
+func acquireBitgetPaperTrader(traderID string, initialBalance float64, newTrader func(float64) *BitgetPaperTrader) *BitgetPaperTrader {
 	if traderID == "" {
-		return NewBitgetPaperTrader(initialBalance)
+		return newTrader(initialBalance)
 	}
 	paperRegistryMu.Lock()
 	defer paperRegistryMu.Unlock()
 	if t, ok := paperRegistry[traderID]; ok {
 		return t
 	}
-	t := NewBitgetPaperTrader(initialBalance)
+	t := newTrader(initialBalance)
+	t.attachState(traderID)
 	paperRegistry[traderID] = t
 	return t
 }
 
-// ReleaseBitgetPaperTrader stops and forgets the paper account of a deleted trader.
+// ReleaseBitgetPaperTrader stops and forgets the paper account of a deleted trader and deletes
+// its snapshot file.
 func ReleaseBitgetPaperTrader(traderID string) {
 	paperRegistryMu.Lock()
 	t := paperRegistry[traderID]
 	delete(paperRegistry, traderID)
 	paperRegistryMu.Unlock()
 	if t != nil {
+		t.disablePersist() // a late mutation must not resurrect the file
 		t.Stop()
 	}
+	removePaperSnapshot(traderID)
 }
 
 // ------------------------------------------------------------------- helpers
@@ -693,6 +720,7 @@ func (t *BitgetPaperTrader) open(symbol, side string, quantity float64, leverage
 		Time:         now,
 	}
 	t.recordFillLocked(f)
+	t.persistLocked()
 	t.mu.Unlock()
 
 	logger.Infof("  📝 [BitgetPaper] %s %s qty=%.6f @ %.6f (mark %.6f, lev %dx, fee %.4f) id=%s", action, symbol, qty, execPrice, mark, lev, fee, f.OrderID)
@@ -737,6 +765,7 @@ func (t *BitgetPaperTrader) closeManual(symbol, side string, quantity float64) (
 		execPrice = mark * (1 + t.slippage)
 	}
 	f := t.closeLocked(pos, qty, execPrice, paperFeeRate(c), paperReasonManual)
+	t.persistLocked()
 	logger.Infof("  📝 [BitgetPaper] %s %s qty=%.6f @ %.6f pnl=%.4f fee=%.4f id=%s", f.Action, symbol, f.Quantity, f.Price, f.RealizedPnL, f.Fee, f.OrderID)
 	return fillResult(f), nil
 }
@@ -761,6 +790,7 @@ func (t *BitgetPaperTrader) closeLocked(pos *paperPosition, qty, execPrice, feeR
 		fee = remaining // clearance fee: the leftover equity is forfeited
 	}
 	t.cash += remaining - fee
+	t.realized += gross
 
 	action, side := "close_long", "SELL"
 	if pos.side == "short" {
@@ -824,15 +854,22 @@ func (t *BitgetPaperTrader) SetLeverage(symbol string, leverage int) error {
 		logger.Infof("  ⚠️ [BitgetPaper] %s leverage %dx clamped to %dx (contract limit)", symbol, leverage, lev)
 	}
 	t.mu.Lock()
-	t.leverage[symbol] = lev
+	if t.leverage[symbol] != lev {
+		t.leverage[symbol] = lev
+		t.persistLocked()
+	}
 	t.mu.Unlock()
 	return nil
 }
 
 // SetMarginMode records the mode. Both modes use the same isolated-style liquidation check.
 func (t *BitgetPaperTrader) SetMarginMode(symbol string, isCrossMargin bool) error {
+	sym := paperSymbol(symbol)
 	t.mu.Lock()
-	t.crossMode[paperSymbol(symbol)] = isCrossMargin
+	if cur, ok := t.crossMode[sym]; !ok || cur != isCrossMargin {
+		t.crossMode[sym] = isCrossMargin
+		t.persistLocked()
+	}
 	t.mu.Unlock()
 	return nil
 }
@@ -899,6 +936,7 @@ func (t *BitgetPaperTrader) setTrigger(symbol, positionSide string, price float6
 	} else {
 		pos.tp = tr
 	}
+	t.persistLocked()
 	logger.Infof("  ✓ [BitgetPaper] %s set: %s %s @ %.6f", label, symbol, pos.side, price)
 	return nil
 }
@@ -927,11 +965,17 @@ func (t *BitgetPaperTrader) cancelTriggers(symbol string, sl, tp bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if pos := t.positions[symbol]; pos != nil {
-		if sl {
+		changed := false
+		if sl && pos.sl != nil {
 			pos.sl = nil
+			changed = true
 		}
-		if tp {
+		if tp && pos.tp != nil {
 			pos.tp = nil
+			changed = true
+		}
+		if changed {
+			t.persistLocked()
 		}
 	}
 }
@@ -1102,6 +1146,10 @@ func (t *BitgetPaperTrader) Tick() {
 			sys = append(sys, *f)
 		}
 	}
+	if len(sys) > 0 || t.dirty {
+		t.dirty = false
+		t.persistLocked() // before the handler runs: the account state is durable first
+	}
 	handler := t.onSysFill
 	t.mu.Unlock()
 
@@ -1130,6 +1178,10 @@ func (t *BitgetPaperTrader) matchPositionLocked(pos *paperPosition, d paperTickD
 			pos.margin += delta
 			pos.funding += delta
 			pos.fundingSlot = slot
+			if slot > t.lastFundingSlot {
+				t.lastFundingSlot = slot
+			}
+			t.dirty = true
 			logger.Infof("  💸 [BitgetPaper] funding %s %s rate=%.6f x%d -> %+.4f USDT", pos.symbol, pos.side, d.rate, n, delta)
 		}
 	}

@@ -939,8 +939,10 @@ func TestPaperConcurrentAccess(t *testing.T) {
 	// everything flat again: no leaked margin
 	b := balanceOf(t, p)
 	near(t, "no locked margin when flat", mustFloat(t, b, "totalWalletBalance"), mustFloat(t, b, "availableBalance"))
-	if mustFloat(t, b, "totalEquity") >= 1_000_000 {
-		t.Fatal("fees and slippage must have cost something")
+	// Equity is not asserted against the starting balance: the goroutines move the marks while
+	// positions are open, so the net result can legitimately be a gain (that made this test flaky).
+	if eq := mustFloat(t, b, "totalEquity"); eq <= 0 || math.IsNaN(eq) || math.IsInf(eq, 0) {
+		t.Fatalf("equity must stay finite and positive, got %v", eq)
 	}
 }
 

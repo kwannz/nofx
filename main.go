@@ -11,6 +11,7 @@ import (
 	"nofx/manager"
 	"nofx/mcp"
 	"nofx/store"
+	"nofx/trader"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -79,6 +80,11 @@ func main() {
 	}
 	defer st.Close()
 	backtest.UseDatabase(st.DB())
+
+	// bitget_paper accounts are snapshotted next to the database (<db dir>/paper/<trader id>.json)
+	// so they survive restarts; must be set before traders are loaded.
+	trader.SetPaperStateDir(trader.DefaultPaperStateDir(cfg.DBType, cfg.DBPath))
+	logger.Infof("📁 Bitget Paper account snapshots: %s", trader.PaperStateDir())
 
 	// Initialize installation ID for experience improvement (anonymous statistics)
 	initInstallationID(st)

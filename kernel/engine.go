@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"nofx/logger"
 	"nofx/market"
@@ -1866,13 +1867,27 @@ func validateDecisionEnv(d *Decision, accountEquity float64, btcEthLeverage, alt
 			}
 		}
 
+		// Like the leverage cap, an oversized position is clamped to the limit instead of
+		// failing: returning an error here would discard every decision of the cycle
+		// (including closes and holds) because the AI asked for too much on one symbol.
 		tolerance := maxPositionValue * 0.01
 		if d.PositionSizeUSD > maxPositionValue+tolerance {
+			scope, minSize := "altcoin", minPositionSizeGeneral
 			if d.Symbol == "BTCUSDT" || d.Symbol == "ETHUSDT" {
-				return fmt.Errorf("BTC/ETH single coin position value cannot exceed %.0f USDT (%.1fx account equity), actual: %.0f", maxPositionValue, posRatio, d.PositionSizeUSD)
-			} else {
-				return fmt.Errorf("altcoin single coin position value cannot exceed %.0f USDT (%.1fx account equity), actual: %.0f", maxPositionValue, posRatio, d.PositionSizeUSD)
+				scope, minSize = "BTC/ETH", minPositionSizeBTCETH
 			}
+			clamped := math.Floor(maxPositionValue*100) / 100
+			if clamped < minSize {
+				return fmt.Errorf("%s single coin position value limit %.2f USDT (%.1fx account equity) is below the minimum opening amount %.2f USDT, requested: %.0f",
+					scope, clamped, posRatio, minSize, d.PositionSizeUSD)
+			}
+			logger.Infof("⚠️  [Position Size Fallback] %s %s single coin position value exceeded (%.2f USDT > %.2f USDT, %.1fx account equity), auto-adjusting to limit %.2f USDT",
+				d.Symbol, scope, d.PositionSizeUSD, maxPositionValue, posRatio, clamped)
+			if d.RiskUSD > 0 {
+				// the risk budget was sized for the requested notional: scale it with the position
+				d.RiskUSD *= clamped / d.PositionSizeUSD
+			}
+			d.PositionSizeUSD = clamped
 		}
 		if d.StopLoss <= 0 || d.TakeProfit <= 0 {
 			return fmt.Errorf("stop loss and take profit must be greater than 0")
