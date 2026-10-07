@@ -4,11 +4,29 @@ import (
 	"fmt"
 	"nofx/crypto"
 	"nofx/logger"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
+
+// Bitget position modes (Exchange.BitgetPositionMode). Hedge is the default, like Binance and
+// OKX in nofx: independent LONG and SHORT positions per symbol.
+const (
+	BitgetPositionModeHedge  = "hedge"
+	BitgetPositionModeOneWay = "one_way"
+)
+
+// NormalizeBitgetPositionMode maps a stored / requested value to BitgetPositionModeHedge or
+// BitgetPositionModeOneWay. Empty and unknown values mean the default, hedge.
+func NormalizeBitgetPositionMode(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "one_way", "one-way", "oneway", "one_way_mode", "net", "single":
+		return BitgetPositionModeOneWay
+	}
+	return BitgetPositionModeHedge
+}
 
 // ExchangeStore exchange storage
 type ExchangeStore struct {
@@ -36,8 +54,13 @@ type Exchange struct {
 	LighterPrivateKey       crypto.EncryptedString `gorm:"column:lighter_private_key;default:''" json:"lighterPrivateKey"`
 	LighterAPIKeyPrivateKey crypto.EncryptedString `gorm:"column:lighter_api_key_private_key;default:''" json:"lighterAPIKeyPrivateKey"`
 	LighterAPIKeyIndex      int             `gorm:"column:lighter_api_key_index;default:0" json:"lighterAPIKeyIndex"`
-	CreatedAt               time.Time       `json:"created_at"`
-	UpdatedAt               time.Time       `json:"updated_at"`
+
+	// BitgetPositionMode is the position mode of bitget / bitget_paper accounts: "hedge"
+	// (default, existing rows get it from the column default) or "one_way".
+	BitgetPositionMode string `gorm:"column:bitget_position_mode;not null;default:hedge" json:"bitgetPositionMode"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (Exchange) TableName() string { return "exchanges" }
@@ -53,6 +76,9 @@ func (s *ExchangeStore) initTables() error {
 		var tableExists int64
 		s.db.Raw(`SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'exchanges'`).Scan(&tableExists)
 		if tableExists > 0 {
+			// Columns added after the table was first created (AutoMigrate is skipped here);
+			// existing rows get the default (hedge)
+			s.db.Exec(`ALTER TABLE exchanges ADD COLUMN IF NOT EXISTS bitget_position_mode TEXT NOT NULL DEFAULT 'hedge'`)
 			// Still run data migrations
 			s.migrateToMultiAccount()
 			s.db.Model(&Exchange{}).Where("account_name = '' OR account_name IS NULL").Update("account_name", "Default")
@@ -184,7 +210,8 @@ func getExchangeNameAndType(exchangeType string) (name string, typ string) {
 func (s *ExchangeStore) Create(userID, exchangeType, accountName string, enabled bool,
 	apiKey, secretKey, passphrase string, testnet bool,
 	hyperliquidWalletAddr, asterUser, asterSigner, asterPrivateKey,
-	lighterWalletAddr, lighterPrivateKey, lighterApiKeyPrivateKey string, lighterApiKeyIndex int) (string, error) {
+	lighterWalletAddr, lighterPrivateKey, lighterApiKeyPrivateKey string, lighterApiKeyIndex int,
+	bitgetPositionMode string) (string, error) {
 
 	id := uuid.New().String()
 	name, typ := getExchangeNameAndType(exchangeType)
@@ -216,6 +243,7 @@ func (s *ExchangeStore) Create(userID, exchangeType, accountName string, enabled
 		LighterPrivateKey:       crypto.EncryptedString(lighterPrivateKey),
 		LighterAPIKeyPrivateKey: crypto.EncryptedString(lighterApiKeyPrivateKey),
 		LighterAPIKeyIndex:      lighterApiKeyIndex,
+		BitgetPositionMode:      NormalizeBitgetPositionMode(bitgetPositionMode),
 	}
 
 	if err := s.db.Create(exchange).Error; err != nil {
@@ -226,7 +254,8 @@ func (s *ExchangeStore) Create(userID, exchangeType, accountName string, enabled
 
 // Update updates exchange configuration by UUID
 func (s *ExchangeStore) Update(userID, id string, enabled bool, apiKey, secretKey, passphrase string, testnet bool,
-	hyperliquidWalletAddr, asterUser, asterSigner, asterPrivateKey, lighterWalletAddr, lighterPrivateKey, lighterApiKeyPrivateKey string, lighterApiKeyIndex int) error {
+	hyperliquidWalletAddr, asterUser, asterSigner, asterPrivateKey, lighterWalletAddr, lighterPrivateKey, lighterApiKeyPrivateKey string, lighterApiKeyIndex int,
+	bitgetPositionMode string) error {
 
 	logger.Debugf("🔧 ExchangeStore.Update: userID=%s, id=%s, enabled=%v", userID, id, enabled)
 
@@ -239,6 +268,11 @@ func (s *ExchangeStore) Update(userID, id string, enabled bool, apiKey, secretKe
 		"lighter_wallet_addr":     lighterWalletAddr,
 		"lighter_api_key_index":   lighterApiKeyIndex,
 		"updated_at":              time.Now().UTC(),
+	}
+
+	// An empty bitgetPositionMode leaves the stored value alone (older clients do not send it)
+	if strings.TrimSpace(bitgetPositionMode) != "" {
+		updates["bitget_position_mode"] = NormalizeBitgetPositionMode(bitgetPositionMode)
 	}
 
 	// Only update encrypted fields if not empty
@@ -309,7 +343,7 @@ func (s *ExchangeStore) CreateLegacy(userID, id, name, typ string, enabled bool,
 	// Check if this is an old-style ID (exchange type as ID)
 	if id == "binance" || id == "bybit" || id == "okx" || id == "bitget" || id == "bitget_paper" || id == "hyperliquid" || id == "aster" || id == "lighter" {
 		_, err := s.Create(userID, id, "Default", enabled, apiKey, secretKey, "", testnet,
-			hyperliquidWalletAddr, asterUser, asterSigner, asterPrivateKey, "", "", "", 0)
+			hyperliquidWalletAddr, asterUser, asterSigner, asterPrivateKey, "", "", "", 0, "")
 		return err
 	}
 

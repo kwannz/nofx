@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"nofx/logger"
+	"nofx/store"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,11 +36,14 @@ const (
 	bitgetHistoryPath      = "/api/v2/mix/order/orders-history"
 	bitgetMarginModePath   = "/api/v2/mix/account/set-margin-mode"
 	bitgetPositionModePath = "/api/v2/mix/account/set-position-mode"
-	bitgetPlaceTPSLPath    = "/api/v2/mix/order/place-tpsl-order"
-	bitgetPlanPendingPath  = "/api/v2/mix/order/orders-plan-pending"
-	bitgetCancelPlanPath   = "/api/v2/mix/order/cancel-plan-order"
-	bitgetOrderDetailPath  = "/api/v2/mix/order/detail"
-	bitgetHistoryPosPath   = "/api/v2/mix/position/history-position"
+	// bitgetAccountDetailPath returns one margin-coin account incl. posMode (hedge_mode /
+	// one_way_mode). The list endpoint (bitgetAccountPath) does NOT report the position mode.
+	bitgetAccountDetailPath = "/api/v2/mix/account/account"
+	bitgetPlaceTPSLPath     = "/api/v2/mix/order/place-tpsl-order"
+	bitgetPlanPendingPath   = "/api/v2/mix/order/orders-plan-pending"
+	bitgetCancelPlanPath    = "/api/v2/mix/order/cancel-plan-order"
+	bitgetOrderDetailPath   = "/api/v2/mix/order/detail"
+	bitgetHistoryPosPath    = "/api/v2/mix/position/history-position"
 	// bitgetFillsPath lists trade fills. NOTE: /api/v2/mix/order/fill-history does NOT exist
 	// (verified on Bitget Demo: code 40404 "Request URL NOT FOUND"); /fills is the real endpoint.
 	bitgetFillsPath = "/api/v2/mix/order/fills"
@@ -76,6 +80,14 @@ type BitgetTrader struct {
 	// Margin mode per symbol ("crossed" / "isolated"), defaults to crossed
 	marginModes     map[string]string
 	marginModeMutex sync.RWMutex
+
+	// Position mode. targetPosMode is what the user configured (bitget_position_mode);
+	// posMode is the mode the ACCOUNT is actually in (detected / switched / refreshed after a
+	// 40774 rejection), "" while unknown. Both hold the API vocabulary (hedge_mode /
+	// one_way_mode) and are guarded by posModeMu.
+	posModeMu     sync.RWMutex
+	targetPosMode string
+	posMode       string
 
 	// Order fill polling
 	orderPollAttempts int
@@ -146,7 +158,7 @@ func (e *BitgetAPIError) Error() string {
 func bitgetErrorHint(code string) string {
 	switch code {
 	case "40774":
-		return "account position mode does not match the order (this bot uses one-way mode: do not send tradeSide)"
+		return "account position mode does not match the order (hedge mode needs tradeSide=open|close, one-way mode must not send tradeSide; the trader re-detects the mode and retries once)"
 	case "45110":
 		return "order amount is below the minimum order size/value"
 	case "40762", "43012":
@@ -183,24 +195,97 @@ func bitgetErrMsgContains(err error, subs ...string) bool {
 	return false
 }
 
+// Position modes. The exchange setting (bitget_position_mode), AutoTraderConfig and the API use
+// "hedge" / "one_way"; Bitget's own API vocabulary is "hedge_mode" / "one_way_mode".
+const (
+	// BitgetPositionModeHedge keeps independent LONG and SHORT positions per symbol (the
+	// default, like Binance and OKX in nofx).
+	BitgetPositionModeHedge = store.BitgetPositionModeHedge
+	// BitgetPositionModeOneWay keeps one net position per symbol.
+	BitgetPositionModeOneWay = store.BitgetPositionModeOneWay
+
+	bitgetPosModeHedge  = "hedge_mode"
+	bitgetPosModeOneWay = "one_way_mode"
+
+	// bitgetModeProbeSymbol is the symbol used to read the account's posMode (the endpoint needs one).
+	bitgetModeProbeSymbol = "BTCUSDT"
+	// bitgetErrPosModeMismatch: the order format (tradeSide / reduceOnly) does not match the account mode.
+	bitgetErrPosModeMismatch = "40774"
+)
+
+// NormalizeBitgetPositionMode maps a user-facing / API value to BitgetPositionModeHedge or
+// BitgetPositionModeOneWay. Empty and unknown values mean the default, hedge.
+func NormalizeBitgetPositionMode(s string) string { return store.NormalizeBitgetPositionMode(s) }
+
+// IsValidBitgetPositionModeSetting reports whether s is an accepted value for the exchange
+// setting (empty = default hedge).
+func IsValidBitgetPositionModeSetting(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", BitgetPositionModeHedge, BitgetPositionModeOneWay:
+		return true
+	}
+	return false
+}
+
+// bitgetAPIPosMode converts the setting vocabulary to Bitget's posMode value.
+func bitgetAPIPosMode(setting string) string {
+	if NormalizeBitgetPositionMode(setting) == BitgetPositionModeOneWay {
+		return bitgetPosModeOneWay
+	}
+	return bitgetPosModeHedge
+}
+
+// bitgetSettingPosMode converts Bitget's posMode value to the setting vocabulary ("" if unknown).
+func bitgetSettingPosMode(apiMode string) string {
+	switch apiMode {
+	case bitgetPosModeHedge:
+		return BitgetPositionModeHedge
+	case bitgetPosModeOneWay:
+		return BitgetPositionModeOneWay
+	}
+	return ""
+}
+
+// BitgetOption customizes NewBitgetTraderWithOptions.
+type BitgetOption func(*BitgetTrader)
+
+// WithBitgetPositionMode sets the position mode the trader tries to put the account in
+// (BitgetPositionModeHedge, the default, or BitgetPositionModeOneWay). When the account cannot
+// be switched (open positions / orders) the trader operates in the mode it detects.
+func WithBitgetPositionMode(mode string) BitgetOption {
+	return func(t *BitgetTrader) { t.targetPosMode = bitgetAPIPosMode(mode) }
+}
+
 // NewBitgetTrader creates a Bitget (live) trader
 func NewBitgetTrader(apiKey, secretKey, passphrase string) *BitgetTrader {
 	return NewBitgetTraderWithOptions(apiKey, secretKey, passphrase, false)
 }
 
-// NewBitgetTraderWithOptions creates a Bitget trader; demo=true enables the demo (paptrading) environment.
-func NewBitgetTraderWithOptions(apiKey, secretKey, passphrase string, demo bool) *BitgetTrader {
-	trader := newBitgetTraderCore(apiKey, secretKey, passphrase, demo)
+// NewBitgetTraderWithOptions creates a Bitget trader; demo=true enables the demo (paptrading)
+// environment. Options (e.g. WithBitgetPositionMode) are applied before the account's position
+// mode is detected / switched.
+func NewBitgetTraderWithOptions(apiKey, secretKey, passphrase string, demo bool, opts ...BitgetOption) *BitgetTrader {
+	return newBitgetTraderAt(bitgetDefaultBaseURL, apiKey, secretKey, passphrase, demo, opts...)
+}
 
-	// Set one-way position mode (net mode)
-	if err := trader.setPositionMode(); err != nil {
-		logger.Infof("⚠️ Failed to set Bitget position mode: %v (ignore if already set)", err)
+// newBitgetTraderAt is NewBitgetTraderWithOptions against an explicit REST endpoint (tests
+// point it at httptest, so the construction-time mode detection never reaches the network).
+func newBitgetTraderAt(baseURL, apiKey, secretKey, passphrase string, demo bool, opts ...BitgetOption) *BitgetTrader {
+	trader := newBitgetTraderCore(apiKey, secretKey, passphrase, demo)
+	trader.baseURL = baseURL
+	for _, opt := range opts {
+		if opt != nil {
+			opt(trader)
+		}
 	}
 
+	// Detect the account's position mode and switch it to the configured one when possible
+	trader.ensurePositionMode()
+
 	if demo {
-		logger.Infof("🟢 [Bitget] Trader initialized (DEMO / paptrading)")
+		logger.Infof("🟢 [Bitget] Trader initialized (DEMO / paptrading, position mode %s)", trader.PositionMode())
 	} else {
-		logger.Infof("🟢 [Bitget] Trader initialized")
+		logger.Infof("🟢 [Bitget] Trader initialized (position mode %s)", trader.PositionMode())
 	}
 
 	return trader
@@ -223,26 +308,169 @@ func newBitgetTraderCore(apiKey, secretKey, passphrase string, demo bool) *Bitge
 		marginModes:       make(map[string]string),
 		orderPollAttempts: 3,
 		orderPollInterval: 300 * time.Millisecond,
+		targetPosMode:     bitgetPosModeHedge,
 	}
 }
 
-// setPositionMode sets one-way position mode
-func (t *BitgetTrader) setPositionMode() error {
+// PositionMode returns the position mode the account is operated in, BitgetPositionModeHedge or
+// BitgetPositionModeOneWay, or "" while it is still unknown (detection failed; the next order
+// then uses the configured mode and self-corrects on a 40774 rejection).
+func (t *BitgetTrader) PositionMode() string {
+	t.posModeMu.RLock()
+	defer t.posModeMu.RUnlock()
+	return bitgetSettingPosMode(t.posMode)
+}
+
+// TargetPositionMode returns the configured position mode (BitgetPositionModeHedge / OneWay).
+func (t *BitgetTrader) TargetPositionMode() string {
+	t.posModeMu.RLock()
+	defer t.posModeMu.RUnlock()
+	return bitgetSettingPosMode(t.targetPosMode)
+}
+
+// IsHedgeMode reports whether orders are currently sent in hedge mode.
+func (t *BitgetTrader) IsHedgeMode() bool {
+	return t.orderPosMode() == bitgetPosModeHedge
+}
+
+// orderPosMode is the API-vocabulary mode orders are built for: the account's mode when
+// known, else the configured one.
+func (t *BitgetTrader) orderPosMode() string {
+	t.posModeMu.RLock()
+	defer t.posModeMu.RUnlock()
+	if t.posMode != "" {
+		return t.posMode
+	}
+	if t.targetPosMode != "" {
+		return t.targetPosMode
+	}
+	return bitgetPosModeHedge
+}
+
+func (t *BitgetTrader) setPosMode(apiMode string) {
+	t.posModeMu.Lock()
+	t.posMode = apiMode
+	t.posModeMu.Unlock()
+}
+
+// detectPositionMode reads the account's current posMode (hedge_mode / one_way_mode).
+func (t *BitgetTrader) detectPositionMode() (string, error) {
+	data, err := t.doRequest("GET", bitgetAccountDetailPath, map[string]interface{}{
+		"symbol":      bitgetModeProbeSymbol,
+		"productType": bitgetProductType,
+		"marginCoin":  "USDT",
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to detect position mode: %w", err)
+	}
+	var acc struct {
+		PosMode string `json:"posMode"`
+	}
+	if err := json.Unmarshal(data, &acc); err != nil {
+		return "", fmt.Errorf("failed to parse account info: %w", err)
+	}
+	if bitgetSettingPosMode(acc.PosMode) == "" {
+		return "", fmt.Errorf("unexpected posMode %q in account info", acc.PosMode)
+	}
+	return acc.PosMode, nil
+}
+
+// switchPositionMode asks Bitget to put the account into apiMode. Bitget refuses while
+// positions or orders (incl. TP/SL plan orders) exist. "Already in this mode" counts as success.
+func (t *BitgetTrader) switchPositionMode(apiMode string) error {
 	body := map[string]interface{}{
 		"productType": bitgetProductType,
-		"posMode":     "one_way_mode",
+		"posMode":     apiMode,
 	}
-
-	_, err := t.doRequest("POST", bitgetPositionModePath, body)
-	if err != nil {
+	if _, err := t.doRequest("POST", bitgetPositionModePath, body); err != nil {
 		if bitgetErrMsgContains(err, "same", "already") {
 			return nil
 		}
 		return err
 	}
-
-	logger.Infof("  ✓ Bitget account switched to one-way position mode")
 	return nil
+}
+
+// ensurePositionMode detects the account's position mode, switches it to the configured one
+// when they differ and records the effective mode. If the switch is refused (positions or
+// orders exist) it warns and operates in the detected mode; if the mode cannot be determined
+// at all it stays unknown and the first order self-corrects on a 40774 rejection.
+func (t *BitgetTrader) ensurePositionMode() {
+	t.posModeMu.RLock()
+	target := t.targetPosMode
+	t.posModeMu.RUnlock()
+
+	detected, derr := t.detectPositionMode()
+	if derr == nil && detected == target {
+		t.setPosMode(detected)
+		logger.Infof("  ✓ Bitget account is already in %s position mode", detected)
+		return
+	}
+	if derr != nil {
+		logger.Warnf("⚠️ [Bitget] cannot detect the account position mode: %v (trying to switch to %s)", derr, target)
+	}
+
+	serr := t.switchPositionMode(target)
+	if serr == nil {
+		t.setPosMode(target)
+		logger.Infof("  ✓ Bitget account switched to %s position mode", target)
+		return
+	}
+
+	if derr != nil {
+		detected, derr = t.detectPositionMode()
+	}
+	if derr != nil {
+		logger.Warnf("⚠️ [Bitget] cannot switch to %s position mode (%v) and the current mode is unknown; orders will use %s and adapt if Bitget rejects them (code %s)",
+			target, serr, target, bitgetErrPosModeMismatch)
+		return
+	}
+	t.setPosMode(detected)
+	logger.Warnf("⚠️ [Bitget] cannot switch the account to %s position mode (%v). Bitget only allows a switch while there are no open positions and no pending/TP-SL orders. "+
+		"Operating in the detected %s mode; close all positions and orders and restart the trader to apply %s, or set the exchange's Bitget position mode to match.",
+		target, serr, detected, target)
+}
+
+// isBitgetPosModeMismatch reports whether err is Bitget's "order does not match the account's
+// position mode" rejection (40774).
+func isBitgetPosModeMismatch(err error) bool {
+	var apiErr *BitgetAPIError
+	return errors.As(err, &apiErr) && apiErr.Code == bitgetErrPosModeMismatch
+}
+
+// isBitgetHoldSideMismatch reports whether err is place-tpsl-order's rejection of a holdSide in the
+// wrong vocabulary for the account's position mode. Verified on Bitget Demo: a hedge account
+// answers holdSide=buy|sell with 43011 "... delegateType is error", a one-way account answers
+// holdSide=long|short with 43011 "... holdSide error" (NOT 40774, which only order placement uses).
+func isBitgetHoldSideMismatch(err error) bool {
+	var apiErr *BitgetAPIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "43011" {
+		return false
+	}
+	msg := strings.ToLower(apiErr.Msg)
+	return strings.Contains(msg, "holdside") || strings.Contains(msg, "delegatetype")
+}
+
+// refreshPositionModeAfterMismatch is called after an order (or TP/SL) built for usedMode was rejected
+// as a position-mode mismatch (40774 / holdSide 43011): it re-detects the account's mode (if that fails, the other mode must be the
+// right one) and records it. It returns the mode to retry with, or ok=false when the mode
+// did not change (the rejection has another cause).
+func (t *BitgetTrader) refreshPositionModeAfterMismatch(usedMode string) (mode string, ok bool) {
+	mode, err := t.detectPositionMode()
+	if err != nil {
+		mode = bitgetPosModeHedge
+		if usedMode == bitgetPosModeHedge {
+			mode = bitgetPosModeOneWay
+		}
+		logger.Warnf("⚠️ [Bitget] order rejected with %s but the account position mode cannot be re-detected (%v): assuming %s",
+			bitgetErrPosModeMismatch, err, mode)
+	}
+	t.setPosMode(mode)
+	if mode == usedMode {
+		return mode, false
+	}
+	logger.Warnf("⚠️ [Bitget] account position mode is %s, not %s: refreshed and retrying once", mode, usedMode)
+	return mode, true
 }
 
 // sign generates Bitget API signature
@@ -413,6 +641,34 @@ func sanitizeBitgetLiquidationPrice(raw string) float64 {
 	return v
 }
 
+// bitgetLiqMaxMarkRatio bounds a believable liquidation price: Bitget reports absurd numbers for
+// positions that cannot be liquidated by price (see sanitizeBitgetPositionLiquidation).
+const bitgetLiqMaxMarkRatio = 100.0
+
+// sanitizeBitgetPositionLiquidation is sanitizeBitgetLiquidationPrice plus a plausibility check
+// against the mark price. Verified on Bitget Demo: with a long and a short of the same symbol open
+// in hedge mode on a cross account, BOTH legs report liquidationPrice "60549679693.55" (about
+// 725000 x the mark) - their risks offset, so there is no price liquidation. A long can only be
+// liquidated BELOW the mark and a short ABOVE it, and nothing beyond 100x the mark is actionable,
+// so anything else is "not applicable" (0 = no liquidation risk, the prompt-schema convention).
+func sanitizeBitgetPositionLiquidation(holdSide string, mark float64, raw string) float64 {
+	liq := sanitizeBitgetLiquidationPrice(raw)
+	if liq <= 0 || mark <= 0 {
+		return liq
+	}
+	if liq > mark*bitgetLiqMaxMarkRatio {
+		return 0
+	}
+	if holdSide == "short" {
+		if liq <= mark {
+			return 0
+		}
+	} else if liq >= mark {
+		return 0
+	}
+	return liq
+}
+
 // GetPositions gets all positions
 func (t *BitgetTrader) GetPositions() ([]map[string]interface{}, error) {
 	// Check cache
@@ -463,7 +719,7 @@ func (t *BitgetTrader) GetPositions() ([]map[string]interface{}, error) {
 		markPrice, _ := strconv.ParseFloat(pos.MarkPrice, 64)
 		unrealizedPnL, _ := strconv.ParseFloat(pos.UnrealizedPL, 64)
 		leverage, _ := strconv.ParseFloat(pos.Leverage, 64)
-		liqPrice := sanitizeBitgetLiquidationPrice(pos.LiquidationPrice)
+		liqPrice := sanitizeBitgetPositionLiquidation(strings.ToLower(pos.HoldSide), markPrice, pos.LiquidationPrice)
 		cTime, _ := strconv.ParseInt(pos.CTime, 10, 64)
 		uTime, _ := strconv.ParseInt(pos.UTime, 10, 64)
 
@@ -656,13 +912,59 @@ func (t *BitgetTrader) SetLeverage(symbol string, leverage int) error {
 	return nil
 }
 
-// placeMarketOrder places a one-way-mode market order and confirms the fill via order/detail.
-// Open long = buy, open short = sell, close long = sell+reduceOnly, close short = buy+reduceOnly.
-// tradeSide is intentionally never sent (one-way mode, would trigger error 40774).
-func (t *BitgetTrader) placeMarketOrder(symbol, side string, quantity float64, reduceOnly bool, label string) (map[string]interface{}, error) {
+// bitgetOrderSide returns the "side" of a place-order request for a position direction
+// ("long"/"short") in the given mode.
+//
+// Hedge mode: side is the POSITION direction and tradeSide says open|close (open long =
+// buy+open, close long = buy+close, open short = sell+open, close short = sell+close; verified
+// on Bitget Demo). One-way mode: side is the real order direction (open long = buy, close long =
+// sell, open short = sell, close short = buy) and closes are reduceOnly.
+func bitgetOrderSide(mode, direction string, closing bool) string {
+	long := direction == "long"
+	if mode != bitgetPosModeHedge && closing {
+		long = !long
+	}
+	if long {
+		return "buy"
+	}
+	return "sell"
+}
+
+// marketOrderBody builds the place-order body of a market order for the given account mode.
+func (t *BitgetTrader) marketOrderBody(symbol, direction string, closing bool, qtyStr, mode string) map[string]interface{} {
+	body := map[string]interface{}{
+		"symbol":      symbol,
+		"productType": bitgetProductType,
+		"marginMode":  t.marginModeFor(symbol),
+		"marginCoin":  "USDT",
+		"side":        bitgetOrderSide(mode, direction, closing),
+		"orderType":   "market",
+		"size":        qtyStr,
+		"clientOid":   genBitgetClientOid(),
+	}
+	if mode == bitgetPosModeHedge {
+		// hedge mode: tradeSide is mandatory and reduceOnly does not exist (the close is
+		// tied to the position of `side`)
+		if closing {
+			body["tradeSide"] = "close"
+		} else {
+			body["tradeSide"] = "open"
+		}
+	} else if closing {
+		// one-way mode: tradeSide must NOT be sent (40774); a close is a reduce-only order
+		body["reduceOnly"] = "YES"
+	}
+	return body
+}
+
+// placeMarketOrder places a market order for the position direction ("long"/"short") and
+// confirms the fill via order/detail. closing=false opens/adds, closing=true reduces. The
+// request format depends on the account's position mode (see bitgetOrderSide); if Bitget
+// rejects it with 40774 (mode mismatch) the mode is re-detected and the order is retried once.
+func (t *BitgetTrader) placeMarketOrder(symbol, direction string, closing bool, quantity float64, label string) (map[string]interface{}, error) {
 	var qtyStr string
 	var err error
-	if reduceOnly {
+	if closing {
 		// Closing must never be blocked by local min-size/notional checks: a residual
 		// position below the minimum would otherwise become impossible to close.
 		qtyStr, err = t.formatQuantityStep(symbol, quantity)
@@ -673,24 +975,21 @@ func (t *BitgetTrader) placeMarketOrder(symbol, side string, quantity float64, r
 		return nil, fmt.Errorf("%s: %w", label, err)
 	}
 
-	body := map[string]interface{}{
-		"symbol":      symbol,
-		"productType": bitgetProductType,
-		"marginMode":  t.marginModeFor(symbol),
-		"marginCoin":  "USDT",
-		"side":        side,
-		"orderType":   "market",
-		"size":        qtyStr,
-		"clientOid":   genBitgetClientOid(),
-	}
-	if reduceOnly {
-		body["reduceOnly"] = "YES"
-	}
-
-	logger.Infof("  📊 Bitget %s: symbol=%s, qty=%s", label, symbol, qtyStr)
-
-	data, err := t.doRequest("POST", bitgetOrderPath, body)
-	if err != nil {
+	mode := t.orderPosMode()
+	var data []byte
+	for attempt := 0; ; attempt++ {
+		body := t.marketOrderBody(symbol, direction, closing, qtyStr, mode)
+		logger.Infof("  📊 Bitget %s: symbol=%s, qty=%s, mode=%s", label, symbol, qtyStr, mode)
+		data, err = t.doRequest("POST", bitgetOrderPath, body)
+		if err == nil {
+			break
+		}
+		if attempt == 0 && isBitgetPosModeMismatch(err) {
+			if newMode, ok := t.refreshPositionModeAfterMismatch(mode); ok {
+				mode = newMode
+				continue
+			}
+		}
 		return nil, fmt.Errorf("failed to %s: %w", label, err)
 	}
 
@@ -750,7 +1049,7 @@ func (t *BitgetTrader) OpenLong(symbol string, quantity float64, leverage int) (
 	if err := t.SetLeverage(symbol, leverage); err != nil {
 		return nil, fmt.Errorf("aborting open long: %w", err)
 	}
-	return t.placeMarketOrder(symbol, "buy", quantity, false, "open long")
+	return t.placeMarketOrder(symbol, "long", false, quantity, "open long")
 }
 
 // OpenShort opens short position
@@ -760,7 +1059,7 @@ func (t *BitgetTrader) OpenShort(symbol string, quantity float64, leverage int) 
 	if err := t.SetLeverage(symbol, leverage); err != nil {
 		return nil, fmt.Errorf("aborting open short: %w", err)
 	}
-	return t.placeMarketOrder(symbol, "sell", quantity, false, "open short")
+	return t.placeMarketOrder(symbol, "short", false, quantity, "open short")
 }
 
 // closeQuantity resolves quantity==0 to the current position size.
@@ -794,7 +1093,7 @@ func (t *BitgetTrader) CloseLong(symbol string, quantity float64) (map[string]in
 	if err != nil {
 		return nil, err
 	}
-	return t.placeMarketOrder(symbol, "sell", qty, true, "close long")
+	return t.placeMarketOrder(symbol, "long", true, qty, "close long")
 }
 
 // CloseShort closes short position
@@ -804,7 +1103,7 @@ func (t *BitgetTrader) CloseShort(symbol string, quantity float64) (map[string]i
 	if err != nil {
 		return nil, err
 	}
-	return t.placeMarketOrder(symbol, "buy", qty, true, "close short")
+	return t.placeMarketOrder(symbol, "short", true, qty, "close short")
 }
 
 // GetMarketPrice gets market price
@@ -933,40 +1232,82 @@ func (t *BitgetTrader) listPlanOrders(symbol string) ([]bitgetPlanOrder, error) 
 	return resp.EntrustedList, nil
 }
 
-// cancelPlanOrderIDs cancels plan orders by id and reports any failures.
-func (t *BitgetTrader) cancelPlanOrderIDs(symbol string, ids []string) error {
-	if len(ids) == 0 {
+// cancelPlanOrders cancels TP/SL plan orders and reports any failure.
+//
+// cancel-plan-order must be called with the plan order's OWN planType (pos_loss / pos_profit /
+// loss_plan / profit_plan), not with the listing's umbrella type "profit_loss": verified on
+// Bitget Demo (one-way and hedge), planType "profit_loss" + orderIdList answers
+// {"successList":[],"failureList":[]} (code 00000) and cancels NOTHING, while planType
+// "pos_loss" + the same orderIdList cancels the stop loss. The orders are therefore grouped
+// by planType and every id must come back in successList; a silent no-op is reported as an error.
+func (t *BitgetTrader) cancelPlanOrders(symbol string, orders []bitgetPlanOrder) error {
+	if len(orders) == 0 {
 		return nil
 	}
-	list := make([]map[string]string, 0, len(ids))
-	for _, id := range ids {
-		list = append(list, map[string]string{"orderId": id})
-	}
-	body := map[string]interface{}{
-		"productType": bitgetProductType,
-		"marginCoin":  "USDT",
-		"symbol":      symbol,
-		"planType":    "profit_loss",
-		"orderIdList": list,
-	}
-	data, err := t.doRequest("POST", bitgetCancelPlanPath, body)
-	if err != nil {
-		return fmt.Errorf("failed to cancel plan orders %v: %w", ids, err)
-	}
-	var resp struct {
-		FailureList []struct {
-			OrderId  string `json:"orderId"`
-			ErrorMsg string `json:"errorMsg"`
-		} `json:"failureList"`
-	}
-	if err := json.Unmarshal(data, &resp); err == nil && len(resp.FailureList) > 0 {
-		var msgs []string
-		for _, f := range resp.FailureList {
-			msgs = append(msgs, fmt.Sprintf("%s: %s", f.OrderId, f.ErrorMsg))
+	byType := map[string][]string{}
+	var types []string
+	for _, o := range orders {
+		if _, ok := byType[o.PlanType]; !ok {
+			types = append(types, o.PlanType)
 		}
-		return fmt.Errorf("failed to cancel plan orders: %s", strings.Join(msgs, "; "))
+		byType[o.PlanType] = append(byType[o.PlanType], o.OrderId)
 	}
-	return nil
+	sort.Strings(types)
+
+	var errs []error
+	for _, planType := range types {
+		ids := byType[planType]
+		list := make([]map[string]string, 0, len(ids))
+		for _, id := range ids {
+			list = append(list, map[string]string{"orderId": id})
+		}
+		body := map[string]interface{}{
+			"productType": bitgetProductType,
+			"marginCoin":  "USDT",
+			"symbol":      symbol,
+			"planType":    planType,
+			"orderIdList": list,
+		}
+		data, err := t.doRequest("POST", bitgetCancelPlanPath, body)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to cancel %s plan orders %v: %w", planType, ids, err))
+			continue
+		}
+		var resp struct {
+			SuccessList []struct {
+				OrderId string `json:"orderId"`
+			} `json:"successList"`
+			FailureList []struct {
+				OrderId  string `json:"orderId"`
+				ErrorMsg string `json:"errorMsg"`
+			} `json:"failureList"`
+		}
+		if err := json.Unmarshal(data, &resp); err != nil {
+			continue // unparseable detail: the call itself succeeded
+		}
+		if len(resp.FailureList) > 0 {
+			var msgs []string
+			for _, f := range resp.FailureList {
+				msgs = append(msgs, fmt.Sprintf("%s: %s", f.OrderId, f.ErrorMsg))
+			}
+			errs = append(errs, fmt.Errorf("failed to cancel plan orders: %s", strings.Join(msgs, "; ")))
+			continue
+		}
+		done := make(map[string]bool, len(resp.SuccessList))
+		for _, s := range resp.SuccessList {
+			done[s.OrderId] = true
+		}
+		var missing []string
+		for _, id := range ids {
+			if !done[id] {
+				missing = append(missing, id)
+			}
+		}
+		if len(missing) > 0 {
+			errs = append(errs, fmt.Errorf("cancel %s plan orders %v: not confirmed by the exchange (successList %d of %d)", planType, missing, len(resp.SuccessList), len(ids)))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // matchingPlanOrders returns the pending TP/SL plan orders of the given kinds for symbol.
@@ -993,14 +1334,6 @@ func (t *BitgetTrader) matchingPlanOrders(symbol string, kinds bitgetTPSLKind, d
 	return out, nil
 }
 
-func planOrderIDs(orders []bitgetPlanOrder) []string {
-	ids := make([]string, 0, len(orders))
-	for _, o := range orders {
-		ids = append(ids, o.OrderId)
-	}
-	return ids
-}
-
 // cancelTPSL cancels pending TP/SL orders of the given kinds. direction ("long"/"short"/"")
 // restricts the cancel to one position side when the exchange reports it.
 func (t *BitgetTrader) cancelTPSL(symbol string, kinds bitgetTPSLKind, direction string) error {
@@ -1009,7 +1342,7 @@ func (t *BitgetTrader) cancelTPSL(symbol string, kinds bitgetTPSLKind, direction
 	if err != nil {
 		return err
 	}
-	return t.cancelPlanOrderIDs(symbol, planOrderIDs(orders))
+	return t.cancelPlanOrders(symbol, orders)
 }
 
 // roundBitgetPrice rounds to pricePlace decimals and to a multiple of priceEndStep.
@@ -1019,21 +1352,35 @@ func roundBitgetPrice(c *BitgetContract, price float64) string {
 	return strconv.FormatFloat(v, 'f', c.PricePlace, 64)
 }
 
+// bitgetHoldSide is the holdSide vocabulary of place-tpsl-order for a position direction
+// ("long"/"short"): hedge mode names the position (long|short), one-way mode uses the
+// order-side vocabulary (buy = long position, sell = short position).
+func bitgetHoldSide(mode, direction string) string {
+	if mode == bitgetPosModeHedge {
+		return direction
+	}
+	if direction == "short" {
+		return "sell"
+	}
+	return "buy"
+}
+
 // placeTPSL places a whole-position stop loss / take profit via place-tpsl-order.
 //
-// place-tpsl-order is an UPSERT for pos_loss / pos_profit (verified on Bitget Demo): placing
-// one for a position that already has one of the same type replaces it in place (same
-// orderId, new trigger), and a rejected placement (e.g. 45122 "stop loss price must be above
-// mark price") leaves the existing order untouched. Cancelling first would only open an
-// unprotected window, so this deliberately does NOT cancel anything: it places the new
-// trigger and propagates the exchange error as-is. Use the Cancel* methods to remove orders.
+// place-tpsl-order is an UPSERT for pos_loss / pos_profit (verified on Bitget Demo, one-way and
+// hedge): placing one for a position (symbol + holdSide) that already has one of the same type
+// replaces it in place (same orderId, new trigger), and a rejected placement (e.g. 45122
+// "stop loss price must be above mark price") leaves the existing order untouched. In hedge
+// mode the long and the short position of a symbol are protected independently. Cancelling
+// first would only open an unprotected window, so this deliberately does NOT cancel anything:
+// it places the new trigger and propagates the exchange error as-is. Use the Cancel* methods
+// to remove orders.
 func (t *BitgetTrader) placeTPSL(symbol, positionSide string, price float64, planType, label string) error {
 	symbol = t.convertSymbol(symbol)
 
-	// holdSide uses the one-way vocabulary of place-tpsl-order: buy = long, sell = short
-	holdSide := "buy"
+	direction := "long"
 	if strings.ToUpper(positionSide) == "SHORT" {
-		holdSide = "sell"
+		direction = "short"
 	}
 
 	contract, err := t.getContract(symbol)
@@ -1042,20 +1389,31 @@ func (t *BitgetTrader) placeTPSL(symbol, positionSide string, price float64, pla
 	}
 	trigger := roundBitgetPrice(contract, price)
 
-	body := map[string]interface{}{
-		"marginCoin":   "USDT",
-		"productType":  bitgetProductType,
-		"symbol":       symbol,
-		"planType":     planType,
-		"triggerPrice": trigger,
-		"triggerType":  "mark_price",
-		"holdSide":     holdSide,
-		"clientOid":    genBitgetClientOid(),
-	}
-	if _, err := t.doRequest("POST", bitgetPlaceTPSLPath, body); err != nil {
+	mode := t.orderPosMode()
+	for attempt := 0; ; attempt++ {
+		body := map[string]interface{}{
+			"marginCoin":   "USDT",
+			"productType":  bitgetProductType,
+			"symbol":       symbol,
+			"planType":     planType,
+			"triggerPrice": trigger,
+			"triggerType":  "mark_price",
+			"holdSide":     bitgetHoldSide(mode, direction),
+			"clientOid":    genBitgetClientOid(),
+		}
+		_, err = t.doRequest("POST", bitgetPlaceTPSLPath, body)
+		if err == nil {
+			break
+		}
+		if attempt == 0 && (isBitgetPosModeMismatch(err) || isBitgetHoldSideMismatch(err)) {
+			if newMode, ok := t.refreshPositionModeAfterMismatch(mode); ok {
+				mode = newMode
+				continue
+			}
+		}
 		return fmt.Errorf("failed to set %s: %w", label, err)
 	}
-	logger.Infof("  ✓ [Bitget] %s set: %s @ %s", label, symbol, trigger)
+	logger.Infof("  ✓ [Bitget] %s set: %s %s @ %s", label, symbol, direction, trigger)
 	return nil
 }
 
@@ -1069,19 +1427,44 @@ func (t *BitgetTrader) SetTakeProfit(symbol string, positionSide string, quantit
 	return t.placeTPSL(symbol, positionSide, takeProfitPrice, "pos_profit", "take profit")
 }
 
-// CancelStopLossOrders cancels stop loss orders
+// CancelStopLossOrders cancels the stop loss orders of symbol (both position sides in hedge
+// mode; use CancelStopLossOrdersForSide to cancel one side only)
 func (t *BitgetTrader) CancelStopLossOrders(symbol string) error {
 	return t.cancelTPSL(symbol, bitgetKindSL, "")
 }
 
-// CancelTakeProfitOrders cancels take profit orders
+// CancelTakeProfitOrders cancels the take profit orders of symbol (both position sides in
+// hedge mode; use CancelTakeProfitOrdersForSide to cancel one side only)
 func (t *BitgetTrader) CancelTakeProfitOrders(symbol string) error {
 	return t.cancelTPSL(symbol, bitgetKindTP, "")
 }
 
-// CancelStopOrders cancels stop loss and take profit orders
+// CancelStopOrders cancels stop loss and take profit orders of symbol (both position sides in
+// hedge mode; use CancelStopOrdersForSide to cancel one side only)
 func (t *BitgetTrader) CancelStopOrders(symbol string) error {
 	return t.cancelTPSL(symbol, bitgetKindAll, "")
+}
+
+// bitgetPositionSideArg normalizes a "LONG"/"SHORT"/"long"/"short" argument to the lower-case
+// direction used by the plan-order filters ("" = both sides).
+func bitgetPositionSideArg(positionSide string) string {
+	return bitgetDirection(positionSide)
+}
+
+// CancelStopLossOrdersForSide cancels only the stop loss of one position side ("LONG"/"SHORT";
+// "" = both). The other side's protection stays untouched.
+func (t *BitgetTrader) CancelStopLossOrdersForSide(symbol, positionSide string) error {
+	return t.cancelTPSL(symbol, bitgetKindSL, bitgetPositionSideArg(positionSide))
+}
+
+// CancelTakeProfitOrdersForSide cancels only the take profit of one position side.
+func (t *BitgetTrader) CancelTakeProfitOrdersForSide(symbol, positionSide string) error {
+	return t.cancelTPSL(symbol, bitgetKindTP, bitgetPositionSideArg(positionSide))
+}
+
+// CancelStopOrdersForSide cancels the stop loss and take profit of one position side.
+func (t *BitgetTrader) CancelStopOrdersForSide(symbol, positionSide string) error {
+	return t.cancelTPSL(symbol, bitgetKindAll, bitgetPositionSideArg(positionSide))
 }
 
 // CancelAllOrders cancels all pending orders (regular + TP/SL plan orders)
@@ -1385,7 +1768,15 @@ func (t *BitgetTrader) GetOpenOrders(symbol string) ([]OpenOrder, error) {
 		size, _ := strconv.ParseFloat(o.Size, 64)
 		side := strings.ToLower(o.Side)
 		posSide := strings.ToUpper(bitgetDirection(o.PosSide))
-		if posSide == "" {
+		if posSide != "" {
+			// hedge mode: side names the POSITION direction, tradeSide says open|close. Report
+			// the real order direction like every other exchange: closing a long is a SELL.
+			if strings.EqualFold(o.TradeSide, "close") {
+				side = map[string]string{"LONG": "sell", "SHORT": "buy"}[posSide]
+			} else {
+				side = map[string]string{"LONG": "buy", "SHORT": "sell"}[posSide]
+			}
+		} else {
 			// one-way: reduceOnly sell closes a long, reduceOnly buy closes a short
 			reduce := strings.EqualFold(o.ReduceOnly, "YES") || strings.EqualFold(o.TradeSide, "close")
 			switch {

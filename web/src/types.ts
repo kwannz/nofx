@@ -136,6 +136,8 @@ export interface Exchange {
   lighterPrivateKey?: string
   lighterApiKeyPrivateKey?: string
   lighterApiKeyIndex?: number
+  // Bitget / Bitget Paper specific: "hedge" (default) or "one_way"
+  bitgetPositionMode?: 'hedge' | 'one_way'
 }
 
 export interface CreateExchangeRequest {
@@ -154,6 +156,7 @@ export interface CreateExchangeRequest {
   lighter_private_key?: string
   lighter_api_key_private_key?: string
   lighter_api_key_index?: number
+  bitget_position_mode?: 'hedge' | 'one_way'
 }
 
 export interface CreateTraderRequest {
@@ -206,6 +209,8 @@ export interface UpdateExchangeConfigRequest {
       lighter_private_key?: string
       lighter_api_key_private_key?: string
       lighter_api_key_index?: number
+      // Bitget / Bitget Paper 持仓模式
+      bitget_position_mode?: 'hedge' | 'one_way'
     }
   }
 }

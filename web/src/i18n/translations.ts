@@ -443,6 +443,11 @@ export const translations = {
       'Use a Bitget Demo API key and trade with simulated funds. Real API keys will be rejected in this mode.',
     bitgetPaperDescription:
       'Local paper trading: orders are simulated in memory against live Bitget public prices (no API key needed). Fees, slippage, liquidation, SL/TP and funding are simulated; the account resets when the server restarts.',
+    bitgetPositionMode: 'Position mode',
+    bitgetPositionModeHedge: 'Hedge mode (long and short at the same time)',
+    bitgetPositionModeOneWay: 'One-way mode (one net position per symbol)',
+    bitgetPositionModeDescription:
+      'Hedge (default): the account can hold a LONG and a SHORT position of the same symbol at once, like Binance/OKX. One-way: one net position per symbol. On a live Bitget account the mode can only be switched while there are no open positions or pending/TP-SL orders; otherwise the trader keeps the account\'s current mode and logs a warning.',
     securityWarning: 'Security Warning',
     saveConfiguration: 'Save Configuration',
 
@@ -1651,6 +1656,11 @@ export const translations = {
       '使用 Bitget Demo API Key，以模拟资金交易。该模式下真实 API Key 会被拒绝。',
     bitgetPaperDescription:
       '本地模拟交易：订单在内存中按 Bitget 实时公开行情撮合，无需任何 API Key。会模拟手续费、滑点、强平、止盈止损和资金费率；服务重启后账户状态会重置。',
+    bitgetPositionMode: '持仓模式',
+    bitgetPositionModeHedge: '双向持仓（可同时持有多仓和空仓）',
+    bitgetPositionModeOneWay: '单向持仓（每个币种只有一个净仓位）',
+    bitgetPositionModeDescription:
+      '双向持仓（默认）：同一币种可同时持有多仓和空仓，与 Binance/OKX 一致。单向持仓：每个币种只有一个净仓位。实盘 Bitget 账户只有在没有持仓、也没有挂单/止盈止损单时才能切换模式；否则交易员会沿用账户当前模式并记录警告。',
     securityWarning: '安全提示',
     saveConfiguration: '保存配置',
 

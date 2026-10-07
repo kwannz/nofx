@@ -28,11 +28,13 @@ import (
 // mutation rate is a few per minute at most and a snapshot is a few KB.
 
 const (
-	// paperSnapshotVersion 2 stores funding progress as unix timestamps (funding_boundary /
-	// last_funding_at). Version 1 stored a slot index in units of the contract's fundInterval
-	// at open time, which breaks when Bitget changes that interval; it is still readable and
-	// migrated on load (see migrate).
-	paperSnapshotVersion    = 2
+	// paperSnapshotVersion 3 adds the position mode (position_mode: "hedge" / "one_way") and
+	// allows a long AND a short position of the same symbol (hedge mode). Version 2 stored
+	// funding progress as unix timestamps (funding_boundary / last_funding_at); version 1 stored
+	// a slot index in units of the contract's fundInterval at open time, which breaks when
+	// Bitget changes that interval. Versions 1 and 2 are still readable and migrated on load
+	// (see migrate): they predate hedge mode, so a non-empty account stays one-way.
+	paperSnapshotVersion    = 3
 	paperSnapshotMinVersion = 1
 	paperPersistMaxFills    = 500 // recent fills kept for GetOrderStatus after a restart
 	paperPersistMaxClosed   = 500 // recent closed-trade records kept for GetClosedPnL
@@ -115,6 +117,7 @@ type paperSnapshot struct {
 	Cash            float64             `json:"cash"`
 	RealizedPnL     float64             `json:"realized_pnl"` // cumulative gross price PnL of closing fills
 	Seq             uint64              `json:"next_order_seq"`
+	PositionMode    string              `json:"position_mode,omitempty"` // v3+: "hedge" / "one_way"
 	LastFundingAt   int64               `json:"last_funding_at"`
 	LastFundingSlot int64               `json:"last_funding_slot,omitempty"` // v1 only (index), read for migration
 	Positions       []paperPositionSnap `json:"positions"`
@@ -204,6 +207,7 @@ func (t *BitgetPaperTrader) snapshotLocked() *paperSnapshot {
 		Cash:          t.cash,
 		RealizedPnL:   t.realized,
 		Seq:           t.seq,
+		PositionMode:  t.posMode,
 		LastFundingAt: t.lastFundingAt,
 		Positions:     make([]paperPositionSnap, 0, len(t.positions)),
 		Leverage:      make(map[string]int, len(t.leverage)),
@@ -271,15 +275,22 @@ func (s *paperSnapshot) validate(traderID string) error {
 	if !finite(s.Initial, s.Cash, s.RealizedPnL) || s.Initial <= 0 || s.Cash < -1e-6 {
 		return fmt.Errorf("invalid balance (initial %v, cash %v)", s.Initial, s.Cash)
 	}
+	// Hedge mode (and every pre-v3 snapshot's one-way mode) allows at most one position per
+	// symbol AND side; one-way mode at most one per symbol.
+	oneWay := s.Version < 3 || NormalizeBitgetPositionMode(s.PositionMode) == BitgetPositionModeOneWay
 	seen := map[string]bool{}
 	for _, p := range s.Positions {
-		if p.Symbol == "" || seen[p.Symbol] {
-			return fmt.Errorf("invalid or duplicate position symbol %q", p.Symbol)
-		}
-		seen[p.Symbol] = true
 		if p.Side != "long" && p.Side != "short" {
 			return fmt.Errorf("position %s: invalid side %q", p.Symbol, p.Side)
 		}
+		key := paperPosKey(p.Symbol, p.Side)
+		if oneWay {
+			key = p.Symbol
+		}
+		if p.Symbol == "" || seen[key] {
+			return fmt.Errorf("invalid or duplicate position %q (%s)", p.Symbol, p.Side)
+		}
+		seen[key] = true
 		// Margin may legitimately be negative: funding is charged against the position margin and
 		// can exceed it while unrealized PnL still keeps the position above liquidation. Only
 		// NaN/Inf are rejected (finite check below).
@@ -306,28 +317,39 @@ func (s *paperSnapshot) validate(traderID string) error {
 // with the contract's CURRENT interval. At worst a boundary that was still pending (rate
 // unavailable) when the v1 snapshot was written is not paid. The marker is clamped to
 // [position open time, now].
+//
+// v2 -> v3: hedge mode did not exist, every account was one-way. An account that holds
+// positions keeps the one-way mode it was opened in (behaviour preserved: no opposite-side
+// open, one position per symbol) until it is flat and the configured mode is applied; an empty
+// account has nothing to preserve and takes the default (hedge).
 func (s *paperSnapshot) migrate(now time.Time) {
-	if s.Version >= 2 {
-		return
-	}
-	saved := s.SavedAt.UTC().Unix()
-	if s.SavedAt.IsZero() || saved > now.UTC().Unix() {
-		saved = now.UTC().Unix()
-	}
-	var latest int64
-	for i := range s.Positions {
-		p := &s.Positions[i]
-		through := saved
-		if opened := p.OpenedAt.UTC().Unix(); !p.OpenedAt.IsZero() && through < opened {
-			through = opened
+	if s.Version < 2 {
+		saved := s.SavedAt.UTC().Unix()
+		if s.SavedAt.IsZero() || saved > now.UTC().Unix() {
+			saved = now.UTC().Unix()
 		}
-		p.FundingBoundary, p.FundingSlot = through, 0
-		if through > latest {
-			latest = through
+		var latest int64
+		for i := range s.Positions {
+			p := &s.Positions[i]
+			through := saved
+			if opened := p.OpenedAt.UTC().Unix(); !p.OpenedAt.IsZero() && through < opened {
+				through = opened
+			}
+			p.FundingBoundary, p.FundingSlot = through, 0
+			if through > latest {
+				latest = through
+			}
 		}
+		s.LastFundingAt, s.LastFundingSlot = latest, 0
+		s.Version = 2
 	}
-	s.LastFundingAt, s.LastFundingSlot = latest, 0
-	s.Version = paperSnapshotVersion
+	if s.Version < 3 {
+		s.PositionMode = BitgetPositionModeHedge
+		if len(s.Positions) > 0 {
+			s.PositionMode = BitgetPositionModeOneWay
+		}
+		s.Version = 3
+	}
 }
 
 // applySnapshotLocked replaces the account state with s. t.mu must be held; s must be valid.
@@ -337,9 +359,10 @@ func (t *BitgetPaperTrader) applySnapshotLocked(s *paperSnapshot) {
 	t.realized = s.RealizedPnL
 	t.seq = s.Seq
 	t.lastFundingAt = s.LastFundingAt
+	t.posMode = NormalizeBitgetPositionMode(s.PositionMode)
 	t.positions = make(map[string]*paperPosition, len(s.Positions))
 	for _, p := range s.Positions {
-		t.positions[p.Symbol] = &paperPosition{
+		t.positions[paperPosKey(p.Symbol, p.Side)] = &paperPosition{
 			id: p.ID, symbol: p.Symbol, side: p.Side, qty: p.Qty, entry: p.Entry,
 			leverage: p.Leverage, margin: p.Margin, openFee: p.OpenFee, funding: p.Funding,
 			openedAt: p.OpenedAt, fundedThrough: p.FundingBoundary,
@@ -481,7 +504,14 @@ func (t *BitgetPaperTrader) attachState(traderID string) {
 	if err == nil && snap.Version < paperSnapshotVersion {
 		from := snap.Version
 		snap.migrate(t.now())
-		logger.Infof("♻️ [BitgetPaper] migrated account snapshot of trader %s from v%d to v%d (funding markers reset to the save time)", traderID, from, snap.Version)
+		note := "account is one-way as before (hedge applies once it is flat)"
+		if len(snap.Positions) == 0 {
+			note = "empty account takes the configured position mode"
+		}
+		if from < 2 {
+			note += "; funding markers reset to the save time"
+		}
+		logger.Infof("♻️ [BitgetPaper] migrated account snapshot of trader %s from v%d to v%d (%s)", traderID, from, snap.Version, note)
 	}
 	if err != nil {
 		// Keep the unreadable file for inspection instead of overwriting it with the next write.
@@ -493,8 +523,8 @@ func (t *BitgetPaperTrader) attachState(traderID string) {
 		return
 	}
 	t.applySnapshotLocked(&snap)
-	logger.Infof("♻️ [BitgetPaper] restored account of trader %s from %s: cash %.4f, %d open positions, %d recent fills, %d closed trades (saved %s)",
-		traderID, path, t.cash, len(t.positions), len(t.fills), len(t.closed), snap.SavedAt.Format(time.RFC3339))
+	logger.Infof("♻️ [BitgetPaper] restored account of trader %s from %s: cash %.4f, %s mode, %d open positions, %d recent fills, %d closed trades (saved %s)",
+		traderID, path, t.cash, t.posMode, len(t.positions), len(t.fills), len(t.closed), snap.SavedAt.Format(time.RFC3339))
 }
 
 // removePaperSnapshot deletes the snapshot of traderID (and any rejected or temp leftovers).

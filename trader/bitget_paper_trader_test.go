@@ -369,6 +369,7 @@ func TestPaperRejections(t *testing.T) {
 
 func TestPaperOppositeSideRejected(t *testing.T) {
 	p, _, _ := newTestPaper(t, 10000)
+	p.SetPositionMode(BitgetPositionModeOneWay) // hedge (the default) allows both sides
 	if _, err := p.OpenLong("BTCUSDT", 1, 5); err != nil {
 		t.Fatal(err)
 	}

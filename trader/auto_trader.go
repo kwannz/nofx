@@ -44,6 +44,8 @@ type AutoTraderConfig struct {
 	BitgetSecretKey string
 	BitgetPassphrase string
 	BitgetTestnet    bool // Use Bitget Demo trading (paptrading header)
+	// BitgetPositionMode is "hedge" (default, "" = hedge) or "one_way"; applies to bitget and bitget_paper
+	BitgetPositionMode string
 
 	// Hyperliquid configuration
 	HyperliquidPrivateKey string
@@ -234,12 +236,15 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 		trader = NewOKXTrader(config.OKXAPIKey, config.OKXSecretKey, config.OKXPassphrase)
 	case "bitget":
 		logger.Infof("🏦 [%s] Using Bitget Futures trading", config.Name)
-		trader = NewBitgetTraderWithOptions(config.BitgetAPIKey, config.BitgetSecretKey, config.BitgetPassphrase, config.BitgetTestnet)
+		trader = NewBitgetTraderWithOptions(config.BitgetAPIKey, config.BitgetSecretKey, config.BitgetPassphrase, config.BitgetTestnet,
+			WithBitgetPositionMode(config.BitgetPositionMode))
 	case "bitget_paper":
 		logger.Infof("🏦 [%s] Using Bitget Paper trading (local simulation on live Bitget prices, initial balance %.2f)", config.Name, config.InitialBalance)
 		// The paper account is kept per trader ID: the API rebuilds the AutoTrader on every
 		// start/update, which must not reset the simulated balance and positions.
-		trader = AcquireBitgetPaperTrader(config.ID, config.InitialBalance)
+		paper := AcquireBitgetPaperTrader(config.ID, config.InitialBalance)
+		paper.SetPositionMode(config.BitgetPositionMode)
+		trader = paper
 	case "hyperliquid":
 		logger.Infof("🏦 [%s] Using Hyperliquid trading", config.Name)
 		trader, err = NewHyperliquidTrader(config.HyperliquidPrivateKey, config.HyperliquidWalletAddr, config.HyperliquidTestnet)

@@ -2,6 +2,7 @@ package trader
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -36,6 +37,9 @@ type fakeBitget struct {
 	// seq makes the nth request to a path return seq[path][n] (the last entry repeats).
 	seq     map[string][]string
 	seqHits map[string]int
+	// dyn builds the data payload from the request (default for cancel-plan-order: confirm every
+	// requested id in successList, like the real exchange does for a valid planType).
+	dyn map[string]func(req bitgetRecReq) string
 }
 
 type bitgetFailFirst struct {
@@ -54,6 +58,17 @@ func newFakeBitget(t *testing.T) *fakeBitget {
 		failFirst: map[string]*bitgetFailFirst{},
 		seq:       map[string][]string{},
 		seqHits:   map[string]int{},
+		dyn:       map[string]func(req bitgetRecReq) string{},
+	}
+	f.dyn[bitgetCancelPlanPath] = func(req bitgetRecReq) string {
+		var ok []string
+		list, _ := req.Body["orderIdList"].([]interface{})
+		for _, e := range list {
+			if m, isMap := e.(map[string]interface{}); isMap {
+				ok = append(ok, fmt.Sprintf(`{"orderId":%q,"clientOid":"c"}`, m["orderId"]))
+			}
+		}
+		return `{"successList":[` + strings.Join(ok, ",") + `],"failureList":[]}`
 	}
 	f.data[bitgetContractsPath] = bitgetTestContracts
 	f.data[bitgetTickerPath] = `[{"symbol":"BTCUSDT","lastPr":"50000"}]`
@@ -79,6 +94,9 @@ func newFakeBitget(t *testing.T) *fakeBitget {
 		f.mu.Lock()
 		f.reqs = append(f.reqs, rec)
 		data, ok := f.data[r.URL.Path]
+		if dyn := f.dyn[r.URL.Path]; dyn != nil {
+			data, ok = dyn(rec), true
+		}
 		if seq := f.seq[r.URL.Path]; len(seq) > 0 {
 			i := f.seqHits[r.URL.Path]
 			if i >= len(seq) {
@@ -111,6 +129,7 @@ func newFakeBitget(t *testing.T) *fakeBitget {
 func (f *fakeBitget) set(path, data string) {
 	f.mu.Lock()
 	f.data[path] = data
+	delete(f.dyn, path) // an explicit payload overrides the dynamic default
 	f.mu.Unlock()
 }
 
@@ -186,11 +205,25 @@ func (f *fakeBitget) last(path string) bitgetRecReq {
 	return rs[len(rs)-1]
 }
 
+// newTestBitget returns a trader whose account is in ONE-WAY mode (the original behaviour most
+// tests were written for); see newTestBitgetMode / newTestBitgetHedge for hedge mode.
 func newTestBitget(t *testing.T, demo bool) (*BitgetTrader, *fakeBitget) {
+	return newTestBitgetMode(t, demo, bitgetPosModeOneWay)
+}
+
+// newTestBitgetHedge returns a trader whose account is in HEDGE mode.
+func newTestBitgetHedge(t *testing.T) (*BitgetTrader, *fakeBitget) {
+	return newTestBitgetMode(t, false, bitgetPosModeHedge)
+}
+
+// newTestBitgetMode builds a trader against the fake server with the account mode preset
+// (no network call, like newBitgetTraderCore). Pass "" to leave the mode unknown.
+func newTestBitgetMode(t *testing.T, demo bool, apiMode string) (*BitgetTrader, *fakeBitget) {
 	f := newFakeBitget(t)
 	tr := newBitgetTraderCore("test-key", "test-secret", "test-pass", demo)
 	tr.baseURL = f.srv.URL
 	tr.orderPollInterval = time.Millisecond
+	tr.setPosMode(apiMode)
 	return tr, f
 }
 
@@ -518,8 +551,34 @@ func TestBitgetCancelFlow(t *testing.T) {
 		if err := tr.CancelStopOrders("BTCUSDT"); err != nil {
 			t.Fatal(err)
 		}
-		if got := ids(f.last(bitgetCancelPlanPath)); len(got) != 2 {
-			t.Errorf("ids = %v", got)
+		// cancel-plan-order needs the plan order's own planType: one request per type
+		reqs := f.find(bitgetCancelPlanPath)
+		if len(reqs) != 2 || reqs[0].Body["planType"] != "pos_loss" || reqs[1].Body["planType"] != "pos_profit" ||
+			len(ids(reqs[0])) != 1 || ids(reqs[0])[0] != "1" || len(ids(reqs[1])) != 1 || ids(reqs[1])[0] != "2" {
+			t.Errorf("cancel requests = %+v", reqs)
+		}
+	})
+	t.Run("never sends the umbrella planType profit_loss", func(t *testing.T) {
+		// verified on Bitget Demo: planType profit_loss answers success with empty lists and cancels nothing
+		tr, f := newTestBitget(t, false)
+		f.set(bitgetPlanPendingPath, plans)
+		_ = tr.CancelStopOrders("BTCUSDT")
+		for _, r := range f.find(bitgetCancelPlanPath) {
+			if pt := r.Body["planType"]; pt == "profit_loss" || pt == "" || pt == nil {
+				t.Errorf("planType = %v", pt)
+			}
+			if r.Body["symbol"] != "BTCUSDT" || r.Body["productType"] != "USDT-FUTURES" || r.Body["marginCoin"] != "USDT" {
+				t.Errorf("body = %v", r.Body)
+			}
+		}
+	})
+	t.Run("a silent no-op is reported", func(t *testing.T) {
+		tr, f := newTestBitget(t, false)
+		f.set(bitgetPlanPendingPath, plans)
+		f.set(bitgetCancelPlanPath, `{"successList":[],"failureList":[]}`)
+		err := tr.CancelStopLossOrders("BTCUSDT")
+		if err == nil || !strings.Contains(err.Error(), "not confirmed") {
+			t.Errorf("an empty successList must not look like success, got %v", err)
 		}
 	})
 	t.Run("no pending is a noop", func(t *testing.T) {
@@ -552,7 +611,7 @@ func TestBitgetCancelFlow(t *testing.T) {
 		if n := len(f.find(bitgetCancelOrderPath)); n != 2 {
 			t.Errorf("cancel-order calls = %d", n)
 		}
-		if len(f.find(bitgetCancelPlanPath)) != 1 {
+		if len(f.find(bitgetCancelPlanPath)) != 2 { // pos_loss + pos_profit (normal_plan is not a TP/SL)
 			t.Errorf("plan orders must still be cancelled")
 		}
 	})

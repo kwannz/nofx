@@ -739,7 +739,7 @@ func TestPaperSnapshotNegativeMarginRoundTrips(t *testing.T) {
 	p.Tick()
 
 	p.mu.Lock()
-	pos := p.positions["BTCUSDT"]
+	pos := p.positions[paperPosKey("BTCUSDT", "long")]
 	var margin float64
 	if pos != nil {
 		margin = pos.margin
@@ -757,7 +757,7 @@ func TestPaperSnapshotNegativeMarginRoundTrips(t *testing.T) {
 		t.Fatalf("negative-margin account was not restored\n got: %s\nwant: %s", got, wantSnapshot)
 	}
 	p2.mu.Lock()
-	gotMargin := p2.positions["BTCUSDT"].margin
+	gotMargin := p2.positions[paperPosKey("BTCUSDT", "long")].margin
 	p2.mu.Unlock()
 	near(t, "restored margin", gotMargin, margin)
 	near(t, "restored equity", mustFloat(t, balanceOf(t, p2), "totalEquity"), wantEquity)
@@ -841,7 +841,7 @@ func TestPaperSnapshotV1MigratesFundingMarkers(t *testing.T) {
 			t.Fatal("v1 snapshot must be restored")
 		}
 		p.mu.Lock()
-		through := p.positions["BTCUSDT"].fundedThrough
+		through := p.positions[paperPosKey("BTCUSDT", "long")].fundedThrough
 		p.mu.Unlock()
 		if through != saved.Unix() {
 			t.Fatalf("funding marker = %d, want save time %d", through, saved.Unix())

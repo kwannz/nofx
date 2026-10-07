@@ -22,9 +22,12 @@ import (
 //   - Market orders only. Fills happen at the current mark price moved 2 bps (default)
 //     against the trader: buys fill higher, sells fill lower.
 //   - Taker fee = the contract's takerFeeRate (fallback 0.06%) on every fill.
-//   - One-way position mode: one position per symbol. Opening the opposite side while a
-//     position exists is rejected (the auto trader closes first). Adding to the same side
-//     averages the entry price.
+//   - Position mode (bitget_position_mode of the exchange setting, default hedge, like the
+//     live Bitget trader): in hedge mode a symbol can hold a LONG and a SHORT position at the
+//     same time, each with its own entry, margin, SL/TP, liquidation and funding; in one-way
+//     mode there is one position per symbol and opening the opposite side while a position
+//     exists is rejected (the auto trader closes first). Adding to the same side averages the
+//     entry price. The mode can only be switched while the account is flat.
 //   - Margin is isolated-style: every position locks notional/leverage of the free
 //     balance. SetMarginMode is recorded but both modes behave identically (the liquidation
 //     check only looks at the position's own margin; free balance never backs a position).
@@ -61,10 +64,11 @@ type BitgetPaperTrader struct {
 
 	mu        sync.Mutex // guards everything below
 	initial   float64
-	cash      float64 // free (unlocked) balance
-	positions map[string]*paperPosition
-	leverage  map[string]int  // per-symbol leverage setting
-	crossMode map[string]bool // per-symbol margin mode flag (informational)
+	cash      float64                   // free (unlocked) balance
+	positions map[string]*paperPosition // keyed by paperPosKey(symbol, side)
+	posMode   string                    // BitgetPositionModeHedge (default) / BitgetPositionModeOneWay
+	leverage  map[string]int            // per-symbol leverage setting
+	crossMode map[string]bool           // per-symbol margin mode flag (informational)
 	fills     []*PaperFill
 	fillIndex map[string]*PaperFill
 	closed    []ClosedPnLRecord
@@ -240,6 +244,7 @@ func newBitgetPaperTrader(initialBalance float64, src paperPriceSource, now func
 		initial:       initialBalance,
 		cash:          initialBalance,
 		positions:     make(map[string]*paperPosition),
+		posMode:       BitgetPositionModeHedge,
 		leverage:      make(map[string]int),
 		crossMode:     make(map[string]bool),
 		fillIndex:     make(map[string]*PaperFill),
@@ -256,6 +261,39 @@ func (t *BitgetPaperTrader) SetSlippageBps(bps float64) {
 	t.mu.Lock()
 	t.slippage = bps / 10000.0
 	t.mu.Unlock()
+}
+
+// paperPosKey is the key of a position: symbol and side. Hedge mode holds a long and a short
+// per symbol; one-way mode never holds both, so the key is unambiguous in both modes.
+func paperPosKey(symbol, side string) string { return symbol + "|" + side }
+
+// PositionMode returns the paper account's position mode (BitgetPositionModeHedge or
+// BitgetPositionModeOneWay).
+func (t *BitgetPaperTrader) PositionMode() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.posMode
+}
+
+// SetPositionMode applies the configured position mode ("hedge" / "one_way", empty = hedge).
+// Like the real exchange it only switches while the account holds no position: with open
+// positions it logs a warning and keeps operating in the current mode (a restored account
+// keeps the mode it was saved with).
+func (t *BitgetPaperTrader) SetPositionMode(mode string) {
+	mode = NormalizeBitgetPositionMode(mode)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.posMode == mode {
+		return
+	}
+	if len(t.positions) > 0 {
+		logger.Warnf("⚠️ [BitgetPaper] cannot switch the paper account from %s to %s position mode while it holds %d open position(s): keeping %s (close all positions and restart the trader to apply %s)",
+			t.posMode, mode, len(t.positions), t.posMode, mode)
+		return
+	}
+	t.posMode = mode
+	t.persistLocked()
+	logger.Infof("  ✓ [BitgetPaper] position mode set to %s", mode)
 }
 
 // SetMatchInterval sets the matcher interval (default 5s). Takes effect on the next Start.
@@ -500,9 +538,13 @@ func (t *BitgetPaperTrader) currentMark(symbol string, fresh bool) (float64, err
 // heldMarks fetches marks (outside the lock) for every symbol with an open position.
 func (t *BitgetPaperTrader) heldMarks(fresh bool) map[string]float64 {
 	t.mu.Lock()
+	seen := make(map[string]bool, len(t.positions))
 	symbols := make([]string, 0, len(t.positions))
-	for s := range t.positions {
-		symbols = append(symbols, s)
+	for _, p := range t.positions {
+		if !seen[p.symbol] {
+			seen[p.symbol] = true
+			symbols = append(symbols, p.symbol)
+		}
 	}
 	t.mu.Unlock()
 	marks := make(map[string]float64, len(symbols))
@@ -532,7 +574,12 @@ func (t *BitgetPaperTrader) sortedPositionsLocked() []*paperPosition {
 	for _, p := range t.positions {
 		out = append(out, p)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].symbol < out[j].symbol })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].symbol != out[j].symbol {
+			return out[i].symbol < out[j].symbol
+		}
+		return out[i].side < out[j].side
+	})
 	return out
 }
 
@@ -687,11 +734,17 @@ func (t *BitgetPaperTrader) open(symbol, side string, quantity float64, leverage
 	lev = paperClampLeverage(c, lev)
 	t.leverage[symbol] = lev
 
-	pos := t.positions[symbol]
-	if pos != nil && pos.side != side {
-		t.mu.Unlock()
-		return nil, fmt.Errorf("open %s %s: a %s position already exists (one-way mode), close it first", side, symbol, pos.side)
+	if t.posMode == BitgetPositionModeOneWay {
+		opposite := "short"
+		if side == "short" {
+			opposite = "long"
+		}
+		if t.positions[paperPosKey(symbol, opposite)] != nil {
+			t.mu.Unlock()
+			return nil, fmt.Errorf("open %s %s: a %s position already exists (one-way mode), close it first", side, symbol, opposite)
+		}
 	}
+	pos := t.positions[paperPosKey(symbol, side)]
 
 	slip := t.slippage
 	execPrice := mark * (1 + slip)
@@ -724,7 +777,7 @@ func (t *BitgetPaperTrader) open(symbol, side string, quantity float64, leverage
 			openedAt:      now,
 			fundedThrough: now.UTC().Unix(),
 		}
-		t.positions[symbol] = pos
+		t.positions[paperPosKey(symbol, side)] = pos
 	} else {
 		pos.entry = (pos.entry*pos.qty + execPrice*qty) / (pos.qty + qty)
 		pos.qty += qty
@@ -774,8 +827,8 @@ func (t *BitgetPaperTrader) closeManual(symbol, side string, quantity float64) (
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	pos := t.positions[symbol]
-	if pos == nil || pos.side != side {
+	pos := t.positions[paperPosKey(symbol, side)]
+	if pos == nil {
 		return nil, fmt.Errorf("close %s %s: %s position not found", side, symbol, side)
 	}
 	qty := pos.qty
@@ -865,7 +918,7 @@ func (t *BitgetPaperTrader) closeLocked(pos *paperPosition, qty, execPrice, feeR
 	pos.margin -= marginPart
 	pos.openFee -= openFeePart
 	if pos.qty <= 1e-12 {
-		delete(t.positions, pos.symbol)
+		delete(t.positions, paperPosKey(pos.symbol, pos.side))
 	}
 	return f
 }
@@ -928,6 +981,33 @@ func (t *BitgetPaperTrader) FormatQuantity(symbol string, quantity float64) (str
 
 // ---------------------------------------------------------------- SL / TP
 
+// triggerTargetLocked resolves the position a SL/TP belongs to. positionSide "long"/"short"
+// (any case) names it exactly (hedge mode holds both); an empty / other value is only
+// accepted when the symbol has exactly one position. t.mu must be held.
+func (t *BitgetPaperTrader) triggerTargetLocked(symbol, positionSide string) (*paperPosition, error) {
+	var held []*paperPosition
+	for _, side := range []string{"long", "short"} {
+		if p := t.positions[paperPosKey(symbol, side)]; p != nil {
+			held = append(held, p)
+		}
+	}
+	if len(held) == 0 {
+		return nil, fmt.Errorf("no open position")
+	}
+	if ps := strings.ToLower(positionSide); ps == "long" || ps == "short" {
+		for _, p := range held {
+			if p.side == ps {
+				return p, nil
+			}
+		}
+		return nil, fmt.Errorf("no %s position (holding %s)", ps, held[0].side)
+	}
+	if len(held) > 1 {
+		return nil, fmt.Errorf("both a long and a short position are open (hedge mode): specify the position side")
+	}
+	return held[0], nil
+}
+
 func (t *BitgetPaperTrader) setTrigger(symbol, positionSide string, price float64, isStop bool) error {
 	symbol = paperSymbol(symbol)
 	label := "take profit"
@@ -949,12 +1029,9 @@ func (t *BitgetPaperTrader) setTrigger(symbol, positionSide string, price float6
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	pos := t.positions[symbol]
-	if pos == nil {
-		return fmt.Errorf("failed to set %s for %s: no open position", label, symbol)
-	}
-	if ps := strings.ToLower(positionSide); (ps == "long" || ps == "short") && ps != pos.side {
-		return fmt.Errorf("failed to set %s for %s: no %s position (holding %s)", label, symbol, ps, pos.side)
+	pos, err := t.triggerTargetLocked(symbol, positionSide)
+	if err != nil {
+		return fmt.Errorf("failed to set %s for %s: %w", label, symbol, err)
 	}
 	// Mirror the exchange: a trigger that is already on the wrong side of the mark is rejected.
 	long := pos.side == "long"
@@ -992,12 +1069,22 @@ func (t *BitgetPaperTrader) SetTakeProfit(symbol string, positionSide string, qu
 	return nil
 }
 
-func (t *BitgetPaperTrader) cancelTriggers(symbol string, sl, tp bool) {
+// cancelTriggers removes the SL and/or TP of symbol. positionSide ("long"/"short", any case)
+// limits it to one position of a hedge-mode symbol; "" covers every position of the symbol.
+func (t *BitgetPaperTrader) cancelTriggers(symbol, positionSide string, sl, tp bool) {
 	symbol = paperSymbol(symbol)
+	side := bitgetDirection(positionSide)
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if pos := t.positions[symbol]; pos != nil {
-		changed := false
+	changed := false
+	for _, ps := range []string{"long", "short"} {
+		if side != "" && side != ps {
+			continue
+		}
+		pos := t.positions[paperPosKey(symbol, ps)]
+		if pos == nil {
+			continue
+		}
 		if sl && pos.sl != nil {
 			pos.sl = nil
 			changed = true
@@ -1006,33 +1093,51 @@ func (t *BitgetPaperTrader) cancelTriggers(symbol string, sl, tp bool) {
 			pos.tp = nil
 			changed = true
 		}
-		if changed {
-			t.persistLocked()
-		}
+	}
+	if changed {
+		t.persistLocked()
 	}
 }
 
-// CancelStopLossOrders removes the stop loss of symbol.
+// CancelStopLossOrders removes the stop loss of symbol (both positions in hedge mode).
 func (t *BitgetPaperTrader) CancelStopLossOrders(symbol string) error {
-	t.cancelTriggers(symbol, true, false)
+	t.cancelTriggers(symbol, "", true, false)
 	return nil
 }
 
-// CancelTakeProfitOrders removes the take profit of symbol.
+// CancelTakeProfitOrders removes the take profit of symbol (both positions in hedge mode).
 func (t *BitgetPaperTrader) CancelTakeProfitOrders(symbol string) error {
-	t.cancelTriggers(symbol, false, true)
+	t.cancelTriggers(symbol, "", false, true)
 	return nil
 }
 
-// CancelStopOrders removes both stop loss and take profit of symbol.
+// CancelStopOrders removes both stop loss and take profit of symbol (both positions in hedge mode).
 func (t *BitgetPaperTrader) CancelStopOrders(symbol string) error {
-	t.cancelTriggers(symbol, true, true)
+	t.cancelTriggers(symbol, "", true, true)
+	return nil
+}
+
+// CancelStopLossOrdersForSide removes only the stop loss of one position side ("LONG"/"SHORT").
+func (t *BitgetPaperTrader) CancelStopLossOrdersForSide(symbol, positionSide string) error {
+	t.cancelTriggers(symbol, positionSide, true, false)
+	return nil
+}
+
+// CancelTakeProfitOrdersForSide removes only the take profit of one position side.
+func (t *BitgetPaperTrader) CancelTakeProfitOrdersForSide(symbol, positionSide string) error {
+	t.cancelTriggers(symbol, positionSide, false, true)
+	return nil
+}
+
+// CancelStopOrdersForSide removes the stop loss and take profit of one position side.
+func (t *BitgetPaperTrader) CancelStopOrdersForSide(symbol, positionSide string) error {
+	t.cancelTriggers(symbol, positionSide, true, true)
 	return nil
 }
 
 // CancelAllOrders removes all pending orders of symbol (only SL/TP exist: orders are market).
 func (t *BitgetPaperTrader) CancelAllOrders(symbol string) error {
-	t.cancelTriggers(symbol, true, true)
+	t.cancelTriggers(symbol, "", true, true)
 	return nil
 }
 
@@ -1130,14 +1235,26 @@ func (t *BitgetPaperTrader) Tick() {
 	t.tickMu.Lock()
 	defer t.tickMu.Unlock()
 
+	// One entry per symbol: hedge mode can hold a long and a short of the same symbol, which
+	// share the mark price, the contract and the funding rate.
 	type held struct {
-		symbol        string
-		fundedThrough int64
+		symbol         string
+		oldestFunded   int64 // earliest fundedThrough among the symbol's positions
+		hasFundedEntry bool
 	}
 	t.mu.Lock()
-	snapshot := make([]held, 0, len(t.positions))
+	snapshot := make([]*held, 0, len(t.positions))
+	bySymbol := make(map[string]*held, len(t.positions))
 	for _, p := range t.sortedPositionsLocked() {
-		snapshot = append(snapshot, held{p.symbol, p.fundedThrough})
+		h := bySymbol[p.symbol]
+		if h == nil {
+			h = &held{symbol: p.symbol}
+			bySymbol[p.symbol] = h
+			snapshot = append(snapshot, h)
+		}
+		if !h.hasFundedEntry || p.fundedThrough < h.oldestFunded {
+			h.oldestFunded, h.hasFundedEntry = p.fundedThrough, true
+		}
 	}
 	t.mu.Unlock()
 	if len(snapshot) == 0 {
@@ -1157,7 +1274,7 @@ func (t *BitgetPaperTrader) Tick() {
 		if c, err := t.source.Contract(h.symbol); err == nil {
 			d.c = c
 		}
-		if d.c != nil && paperFundingDue(now, paperFundHours(d.c), h.fundedThrough) > 0 {
+		if d.c != nil && paperFundingDue(now, paperFundHours(d.c), h.oldestFunded) > 0 {
 			if r, err := t.source.FundingRate(h.symbol); err == nil {
 				d.rate, d.rateOK = r, true
 			} else {

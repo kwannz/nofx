@@ -453,6 +453,7 @@ type SafeExchangeConfig struct {
 	AsterUser             string `json:"asterUser"`             // Aster username (not sensitive)
 	AsterSigner           string `json:"asterSigner"`           // Aster signer (not sensitive)
 	LighterWalletAddr     string `json:"lighterWalletAddr"`     // LIGHTER wallet address (not sensitive)
+	BitgetPositionMode    string `json:"bitgetPositionMode"`    // Bitget / Bitget Paper position mode: "hedge" (default) or "one_way"
 }
 
 type UpdateModelConfigRequest struct {
@@ -479,6 +480,7 @@ type UpdateExchangeConfigRequest struct {
 		LighterPrivateKey       string `json:"lighter_private_key"`
 		LighterAPIKeyPrivateKey string `json:"lighter_api_key_private_key"`
 		LighterAPIKeyIndex      int    `json:"lighter_api_key_index"`
+		BitgetPositionMode      string `json:"bitget_position_mode"` // "hedge" (default) | "one_way"; empty keeps the stored value
 	} `json:"exchanges"`
 }
 
@@ -612,6 +614,7 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 				string(exchangeCfg.SecretKey),
 				string(exchangeCfg.Passphrase),
 				exchangeCfg.Testnet,
+				trader.WithBitgetPositionMode(exchangeCfg.BitgetPositionMode),
 			)
 		case "bitget_paper":
 			// Local simulation: no keys. A throw-away account only reports the starting balance
@@ -1163,6 +1166,7 @@ func (s *Server) handleSyncBalance(c *gin.Context) {
 			string(exchangeCfg.SecretKey),
 			string(exchangeCfg.Passphrase),
 			exchangeCfg.Testnet,
+			trader.WithBitgetPositionMode(exchangeCfg.BitgetPositionMode),
 		)
 	case "bitget_paper":
 		// The simulated account lives in memory inside the loaded trader: a fresh instance
@@ -1325,6 +1329,7 @@ func (s *Server) handleClosePosition(c *gin.Context) {
 			string(exchangeCfg.SecretKey),
 			string(exchangeCfg.Passphrase),
 			exchangeCfg.Testnet,
+			trader.WithBitgetPositionMode(exchangeCfg.BitgetPositionMode),
 		)
 	case "bitget_paper":
 		// The simulated account lives in memory inside the loaded trader: a fresh instance
@@ -1794,6 +1799,7 @@ func (s *Server) handleGetExchangeConfigs(c *gin.Context) {
 			AsterUser:             exchange.AsterUser,
 			AsterSigner:           exchange.AsterSigner,
 			LighterWalletAddr:     exchange.LighterWalletAddr,
+			BitgetPositionMode:    store.NormalizeBitgetPositionMode(exchange.BitgetPositionMode),
 		}
 	}
 
@@ -1860,9 +1866,17 @@ func (s *Server) handleUpdateExchangeConfigs(c *gin.Context) {
 		logger.Infof("🔓 Decrypted exchange config data (UserID: %s)", userID)
 	}
 
+	// Validate before touching anything so a bad value does not leave a half-applied update
+	for exchangeID, exchangeData := range req.Exchanges {
+		if !trader.IsValidBitgetPositionModeSetting(exchangeData.BitgetPositionMode) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid bitget_position_mode %q for exchange %s (use \"hedge\" or \"one_way\")", exchangeData.BitgetPositionMode, exchangeID)})
+			return
+		}
+	}
+
 	// Update each exchange's configuration
 	for exchangeID, exchangeData := range req.Exchanges {
-		err := s.store.Exchange().Update(userID, exchangeID, exchangeData.Enabled, exchangeData.APIKey, exchangeData.SecretKey, exchangeData.Passphrase, exchangeData.Testnet, exchangeData.HyperliquidWalletAddr, exchangeData.AsterUser, exchangeData.AsterSigner, exchangeData.AsterPrivateKey, exchangeData.LighterWalletAddr, exchangeData.LighterPrivateKey, exchangeData.LighterAPIKeyPrivateKey, exchangeData.LighterAPIKeyIndex)
+		err := s.store.Exchange().Update(userID, exchangeID, exchangeData.Enabled, exchangeData.APIKey, exchangeData.SecretKey, exchangeData.Passphrase, exchangeData.Testnet, exchangeData.HyperliquidWalletAddr, exchangeData.AsterUser, exchangeData.AsterSigner, exchangeData.AsterPrivateKey, exchangeData.LighterWalletAddr, exchangeData.LighterPrivateKey, exchangeData.LighterAPIKeyPrivateKey, exchangeData.LighterAPIKeyIndex, exchangeData.BitgetPositionMode)
 		if err != nil {
 			SafeInternalError(c, fmt.Sprintf("Update exchange %s", exchangeID), err)
 			return
@@ -1897,6 +1911,7 @@ type CreateExchangeRequest struct {
 	LighterPrivateKey       string `json:"lighter_private_key"`
 	LighterAPIKeyPrivateKey string `json:"lighter_api_key_private_key"`
 	LighterAPIKeyIndex      int    `json:"lighter_api_key_index"`
+	BitgetPositionMode      string `json:"bitget_position_mode"` // "hedge" (default) | "one_way"; Bitget / Bitget Paper only
 }
 
 // handleCreateExchange Create a new exchange account
@@ -1960,12 +1975,18 @@ func (s *Server) handleCreateExchange(c *gin.Context) {
 		return
 	}
 
+	if !trader.IsValidBitgetPositionModeSetting(req.BitgetPositionMode) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid bitget_position_mode %q (use \"hedge\" or \"one_way\")", req.BitgetPositionMode)})
+		return
+	}
+
 	// Create new exchange account
 	id, err := s.store.Exchange().Create(
 		userID, req.ExchangeType, req.AccountName, req.Enabled,
 		req.APIKey, req.SecretKey, req.Passphrase, req.Testnet,
 		req.HyperliquidWalletAddr, req.AsterUser, req.AsterSigner, req.AsterPrivateKey,
 		req.LighterWalletAddr, req.LighterPrivateKey, req.LighterAPIKeyPrivateKey, req.LighterAPIKeyIndex,
+		req.BitgetPositionMode,
 	)
 	if err != nil {
 		logger.Infof("❌ Failed to create exchange account: %v", err)

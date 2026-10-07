@@ -28,6 +28,7 @@ type BitgetTrade struct {
 	OrderType   string
 	OrderAction string // open_long, open_short, close_long, close_short
 	TradeSide   string // raw tradeSide (open/close/buy_single/sell_single/...)
+	PosMode     string // raw posMode of the fill: hedge_mode / one_way_mode ("" when not reported)
 	// ActionAmbiguous marks fills whose OrderAction was guessed from realized profit == 0
 	// (one-way fills): a break-even close looks exactly like an open. SyncOrdersFromBitget
 	// re-classifies those against the open positions in the store, in time order.
@@ -184,6 +185,7 @@ func (t *BitgetTrader) GetTrades(startTime time.Time, limit int) ([]BitgetTrade,
 				Profit     string `json:"profit"`
 				CTime      string `json:"cTime"`
 				TradeSide  string `json:"tradeSide"`
+				PosMode    string `json:"posMode"`    // hedge_mode / one_way_mode
 				TradeScope string `json:"tradeScope"` // taker / maker
 				FeeDetail  []struct {
 					FeeCoin  string `json:"feeCoin"`
@@ -236,6 +238,7 @@ func (t *BitgetTrader) GetTrades(startTime time.Time, limit int) ([]BitgetTrade,
 				OrderType:   "MARKET",
 				OrderAction: action,
 				TradeSide:   fill.TradeSide,
+				PosMode:     fill.PosMode,
 
 				ActionAmbiguous: ambiguous,
 			})
@@ -316,9 +319,22 @@ func (t *BitgetTrader) SyncOrdersFromBitget(traderID string, exchangeID string, 
 		if strings.Contains(trade.OrderAction, "short") {
 			positionSide = "SHORT"
 		}
+		// Hedge-mode fills belong to a LONG or SHORT position leg; one-way fills have no leg ("BOTH")
+		orderPositionSide := "BOTH"
+		if trade.PosMode == bitgetPosModeHedge {
+			orderPositionSide = positionSide
+		}
 
-		// Normalize side for storage
+		// Normalize side for storage: the real order direction. One-way fills report it in
+		// `side`; hedge fills report the POSITION direction there (a "buy"/"close" fill closes a
+		// long by selling), so derive it from the classified action, like every other exchange.
 		side := strings.ToUpper(trade.Side)
+		switch trade.OrderAction {
+		case "open_long", "close_short":
+			side = "BUY"
+		case "open_short", "close_long":
+			side = "SELL"
+		}
 
 		// Create order record - use UTC time in milliseconds to avoid timezone issues
 		execTimeMs := trade.ExecTime.UTC().UnixMilli()
@@ -329,7 +345,7 @@ func (t *BitgetTrader) SyncOrdersFromBitget(traderID string, exchangeID string, 
 			ExchangeOrderID: trade.TradeID,
 			Symbol:          symbol,
 			Side:            side,
-			PositionSide:    "BOTH", // Bitget uses one-way position mode
+			PositionSide:    orderPositionSide,
 			Type:            trade.OrderType,
 			OrderAction:     trade.OrderAction,
 			Quantity:        trade.FillQty,

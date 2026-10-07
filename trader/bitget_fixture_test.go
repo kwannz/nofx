@@ -209,9 +209,10 @@ func TestBitgetFixtureCancelTPSLDirectionMatching(t *testing.T) {
 		direction string
 		want      []string
 	}{
-		{"long plans, long direction", "plan_pending", bitgetKindAll, "long", []string{longTP, longSL}},
+		// one cancel request per planType, in planType order: pos_loss (SL) before pos_profit (TP)
+		{"long plans, long direction", "plan_pending", bitgetKindAll, "long", []string{longSL, longTP}},
 		{"long plans, short direction cancels nothing", "plan_pending", bitgetKindAll, "short", nil},
-		{"long plans, no direction", "plan_pending", bitgetKindAll, "", []string{longTP, longSL}},
+		{"long plans, no direction", "plan_pending", bitgetKindAll, "", []string{longSL, longTP}},
 		{"long plans, SL only", "plan_pending", bitgetKindSL, "long", []string{longSL}},
 		{"long plans, TP only", "plan_pending", bitgetKindTP, "", []string{longTP}},
 		{"short plan, short direction", "plan_pending_short", bitgetKindSL, "short", []string{shortSL}},

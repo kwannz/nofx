@@ -13,71 +13,79 @@ import (
 	"nofx/store"
 )
 
+// demoCreds are the Bitget DEMO API credentials of the environment (never logged).
+type demoCreds struct{ key, secret, pass string }
+
+func (c demoCreds) trader(opts ...BitgetOption) *BitgetTrader {
+	return NewBitgetTraderWithOptions(c.key, c.secret, c.pass, true, opts...)
+}
+
 // TestBitgetDemoIntegration drives the live trader against the Bitget DEMO environment
-// (one-way mode, USDT-FUTURES, header paptrading: 1). It trades the minimum BTCUSDT size
-// (long leg, then short leg), checks every response shape the trader depends on and MUST leave
-// the account flat: cleanup closes anything left, cancels all orders and then asserts that no
-// position and no pending / TP-SL order remains.
+// (USDT-FUTURES, header paptrading: 1) in BOTH position modes: first the one-way flow (the
+// account is switched to one_way_mode), then the hedge flow (switched to hedge_mode: long and
+// short open at the same time, TP/SL on each side, independent closes). It trades the minimum
+// BTCUSDT size, checks every response shape the trader depends on, and MUST leave the account
+// flat and in hedge_mode (the default): each flow's cleanup closes anything left, cancels all
+// orders and asserts that no position and no pending / TP-SL order remains. Mode switches
+// only happen while the account is flat (Bitget refuses otherwise).
 //
 //	source bitget_demo.env   # BITGET_DEMO_API_KEY / BITGET_DEMO_SECRET_KEY / BITGET_DEMO_PASSPHRASE
 //	go test ./trader -run TestBitgetDemoIntegration -count=1 -v
 func TestBitgetDemoIntegration(t *testing.T) {
-	key := os.Getenv("BITGET_DEMO_API_KEY")
-	secret := os.Getenv("BITGET_DEMO_SECRET_KEY")
-	pass := os.Getenv("BITGET_DEMO_PASSPHRASE")
-	if key == "" || secret == "" || pass == "" {
+	creds := demoCreds{
+		key:    os.Getenv("BITGET_DEMO_API_KEY"),
+		secret: os.Getenv("BITGET_DEMO_SECRET_KEY"),
+		pass:   os.Getenv("BITGET_DEMO_PASSPHRASE"),
+	}
+	if creds.key == "" || creds.secret == "" || creds.pass == "" {
 		t.Skip("BITGET_DEMO_API_KEY / BITGET_DEMO_SECRET_KEY / BITGET_DEMO_PASSPHRASE not set")
 	}
-
-	tr := NewBitgetTraderWithOptions(key, secret, pass, true)
 	const symbol = "BTCUSDT"
 
-	// ---- pre-flight: never run on top of a position / orders we did not open ----
-	if pos, err := demoPositions(tr, symbol); err != nil || len(pos) != 0 {
+	// Pre-flight with a trader that makes no mode change on construction: never run on top of
+	// positions / orders we did not open (and a mode switch would be refused anyway).
+	probe := newBitgetTraderCore(creds.key, creds.secret, creds.pass, true)
+	if pos, err := demoPositions(probe, symbol); err != nil || len(pos) != 0 {
 		t.Fatalf("demo account is not flat before the test, refusing to trade (err=%v): %v", err, pos)
 	}
-	if orders, err := tr.GetOpenOrders(symbol); err != nil || len(orders) != 0 {
+	if orders, err := probe.GetOpenOrders(""); err != nil || len(orders) != 0 {
 		t.Fatalf("demo account has pending orders before the test (err=%v): %+v", err, orders)
 	}
+	if all, err := probe.GetPositions(); err != nil || len(all) != 0 {
+		t.Fatalf("demo account holds positions in other symbols (err=%v): %v", err, all)
+	}
 
-	// ---- cleanup: leave the account flat, then PROVE it ----
+	// Whatever happens below, the account ends up flat and in hedge_mode (the default).
 	t.Cleanup(func() {
-		if err := tr.CancelAllOrders(symbol); err != nil {
-			t.Logf("cleanup CancelAllOrders: %v", err)
+		tr := creds.trader() // default target = hedge: switches the (flat) account back
+		if tr.PositionMode() != BitgetPositionModeHedge {
+			t.Errorf("ACCOUNT NOT RESTORED: position mode is %q after the test, want hedge", tr.PositionMode())
 		}
-		leftover, err := demoPositions(tr, symbol)
-		if err != nil {
-			t.Errorf("cleanup: GetPositions: %v", err)
-		}
-		for _, p := range leftover {
-			side, _ := p["side"].(string)
-			var err error
-			if side == "short" {
-				_, err = tr.CloseShort(symbol, 0)
-			} else {
-				_, err = tr.CloseLong(symbol, 0)
-			}
-			if err != nil {
-				t.Errorf("cleanup: closing leftover %s position: %v", side, err)
-			}
-		}
-		// an exchange-side TP/SL disappears with its position; wait for that, then cancel stragglers
-		waitFor(t, 10*time.Second, "TP/SL orders to vanish after the position is closed", func() (bool, string) {
-			orders, err := tr.GetOpenOrders(symbol)
-			return err == nil && len(orders) == 0, fmt.Sprintf("orders=%+v err=%v", orders, err)
-		})
-		if err := tr.CancelAllOrders(symbol); err != nil {
-			t.Logf("cleanup CancelAllOrders (2): %v", err)
-		}
-		if pos, err := demoPositions(tr, symbol); err != nil || len(pos) != 0 {
-			t.Errorf("ACCOUNT NOT FLAT after the test: positions=%v err=%v", pos, err)
-		}
-		if orders, err := tr.GetOpenOrders(symbol); err != nil || len(orders) != 0 {
-			t.Errorf("ACCOUNT NOT FLAT after the test: pending orders=%+v err=%v", orders, err)
+		if mode, err := tr.detectPositionMode(); err != nil || mode != bitgetPosModeHedge {
+			t.Errorf("ACCOUNT NOT RESTORED: exchange reports posMode %q (err %v), want hedge_mode", mode, err)
 		} else {
-			t.Logf("flat check OK: no %s position and no pending/TP-SL orders", symbol)
+			t.Logf("account restored to %s", mode)
+		}
+		if pos, err := tr.GetPositions(); err != nil || len(pos) != 0 {
+			t.Errorf("ACCOUNT NOT FLAT at the end: positions=%v err=%v", pos, err)
 		}
 	})
+
+	t.Run("one_way", func(t *testing.T) { demoOneWayFlow(t, creds, symbol) })
+	t.Run("hedge", func(t *testing.T) { demoHedgeFlow(t, creds, symbol) })
+}
+
+// demoOneWayFlow: one-way mode, long leg then short leg (the original integration flow).
+func demoOneWayFlow(t *testing.T, creds demoCreds, symbol string) {
+	tr := creds.trader(WithBitgetPositionMode(BitgetPositionModeOneWay))
+	if tr.PositionMode() != BitgetPositionModeOneWay {
+		t.Fatalf("the flat demo account must have been switched to one-way mode, got %q", tr.PositionMode())
+	}
+	if mode, err := tr.detectPositionMode(); err != nil || mode != bitgetPosModeOneWay {
+		t.Fatalf("exchange reports posMode %q (err %v), want one_way_mode", mode, err)
+	}
+
+	demoRegisterFlatCleanup(t, tr, symbol)
 
 	bal, err := tr.GetBalance()
 	if err != nil {
@@ -110,9 +118,15 @@ func TestBitgetDemoIntegration(t *testing.T) {
 	var orders []placed
 
 	// =========================== LONG leg ===========================
+	// first order with a deliberately wrong mode belief (hedge): Bitget answers 40774, the trader
+	// re-detects one_way_mode and retries once
+	tr.setPosMode(bitgetPosModeHedge)
 	open, err := tr.OpenLong(symbol, qty, 3)
 	if err != nil {
-		t.Fatalf("OpenLong: %v", err)
+		t.Fatalf("OpenLong must self-correct after a 40774 rejection: %v", err)
+	}
+	if tr.PositionMode() != BitgetPositionModeOneWay {
+		t.Errorf("the mode belief must be refreshed to one_way after the rejection, got %q", tr.PositionMode())
 	}
 	checkFilled(t, "OpenLong", open, qty)
 	orders = append(orders, placed{"open long", open["orderId"].(string), "open_long"})
@@ -159,6 +173,34 @@ func TestBitgetDemoIntegration(t *testing.T) {
 	if sl3.StopPrice != sl2.StopPrice || sl3.OrderID != sl2.OrderID {
 		t.Errorf("rejected SL changed the live one: %+v -> %+v", sl2, sl3)
 	}
+
+	// cancel-plan-order must be sent with the plan order's own planType: cancelling the SL
+	// removes exactly the SL and leaves the TP alone (planType "profit_loss" would be a silent no-op)
+	if err := tr.CancelStopLossOrders(symbol); err != nil {
+		t.Fatalf("CancelStopLossOrders: %v", err)
+	}
+	waitFor(t, 8*time.Second, "only the TP to remain after cancelling the SL", func() (bool, string) {
+		o, err := tr.GetOpenOrders(symbol)
+		return err == nil && len(o) == 1 && o[0].Type == "TAKE_PROFIT_MARKET", fmt.Sprintf("orders=%+v err=%v", o, err)
+	})
+	if err := tr.SetStopLoss(symbol, "LONG", qty, slPrice); err != nil {
+		t.Fatalf("SetStopLoss (re-place after cancel): %v", err)
+	}
+	demoPlanOrders(t, tr, symbol, "LONG", "SELL")
+	if err := tr.CancelStopOrders(symbol); err != nil {
+		t.Fatalf("CancelStopOrders: %v", err)
+	}
+	waitFor(t, 8*time.Second, "all TP/SL to be cancelled", func() (bool, string) {
+		o, err := tr.GetOpenOrders(symbol)
+		return err == nil && len(o) == 0, fmt.Sprintf("orders=%+v err=%v", o, err)
+	})
+	if err := tr.SetStopLoss(symbol, "LONG", qty, slPrice); err != nil {
+		t.Fatalf("SetStopLoss (after cancel all): %v", err)
+	}
+	if err := tr.SetTakeProfit(symbol, "LONG", qty, tpPrice); err != nil {
+		t.Fatalf("SetTakeProfit (after cancel all): %v", err)
+	}
+	demoPlanOrders(t, tr, symbol, "LONG", "SELL")
 
 	closeLong, err := tr.CloseLong(symbol, 0)
 	if err != nil {
@@ -323,6 +365,50 @@ func TestBitgetDemoIntegration(t *testing.T) {
 }
 
 // ---------------------------------------------------------------- helpers
+
+// demoRegisterFlatCleanup registers the cleanup that leaves the account flat and PROVES it:
+// close every leftover position (either side), cancel all orders, wait for the exchange-side
+// TP/SL to vanish, then assert that no position and no pending / TP-SL order remains.
+func demoRegisterFlatCleanup(t *testing.T, tr *BitgetTrader, symbol string) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := tr.CancelAllOrders(symbol); err != nil {
+			t.Logf("cleanup CancelAllOrders: %v", err)
+		}
+		leftover, err := demoPositions(tr, symbol)
+		if err != nil {
+			t.Errorf("cleanup: GetPositions: %v", err)
+		}
+		for _, p := range leftover {
+			side, _ := p["side"].(string)
+			var err error
+			if side == "short" {
+				_, err = tr.CloseShort(symbol, 0)
+			} else {
+				_, err = tr.CloseLong(symbol, 0)
+			}
+			if err != nil {
+				t.Errorf("cleanup: closing leftover %s position: %v", side, err)
+			}
+		}
+		// an exchange-side TP/SL disappears with its position; wait for that, then cancel stragglers
+		waitFor(t, 10*time.Second, "TP/SL orders to vanish after the position is closed", func() (bool, string) {
+			orders, err := tr.GetOpenOrders(symbol)
+			return err == nil && len(orders) == 0, fmt.Sprintf("orders=%+v err=%v", orders, err)
+		})
+		if err := tr.CancelAllOrders(symbol); err != nil {
+			t.Logf("cleanup CancelAllOrders (2): %v", err)
+		}
+		if pos, err := demoPositions(tr, symbol); err != nil || len(pos) != 0 {
+			t.Errorf("ACCOUNT NOT FLAT after the test: positions=%v err=%v", pos, err)
+		}
+		if orders, err := tr.GetOpenOrders(symbol); err != nil || len(orders) != 0 {
+			t.Errorf("ACCOUNT NOT FLAT after the test: pending orders=%+v err=%v", orders, err)
+		} else {
+			t.Logf("flat check OK: no %s position and no pending/TP-SL orders", symbol)
+		}
+	})
+}
 
 // demoPositions returns the live positions of symbol, bypassing the 15 s positions cache.
 func demoPositions(tr *BitgetTrader, symbol string) ([]map[string]interface{}, error) {

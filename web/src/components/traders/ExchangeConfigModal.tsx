@@ -29,6 +29,8 @@ const SUPPORTED_EXCHANGE_TEMPLATES = [
   { exchange_type: 'lighter', name: 'Lighter', type: 'dex' as const },
 ]
 
+export type BitgetPositionMode = 'hedge' | 'one_way'
+
 interface ExchangeConfigModalProps {
   allExchanges: Exchange[]
   editingExchangeId: string | null
@@ -47,7 +49,8 @@ interface ExchangeConfigModalProps {
     lighterWalletAddr?: string,
     lighterPrivateKey?: string,
     lighterApiKeyPrivateKey?: string,
-    lighterApiKeyIndex?: number
+    lighterApiKeyIndex?: number,
+    bitgetPositionMode?: BitgetPositionMode // Bitget / Bitget Paper 专用
   ) => Promise<void>
   onDelete: (exchangeId: string) => void
   onClose: () => void
@@ -93,6 +96,10 @@ export function ExchangeConfigModal({
   const [lighterWalletAddr, setLighterWalletAddr] = useState('')
   const [lighterApiKeyPrivateKey, setLighterApiKeyPrivateKey] = useState('')
   const [lighterApiKeyIndex, setLighterApiKeyIndex] = useState(0)
+
+  // Bitget / Bitget Paper 持仓模式（默认双向持仓 hedge）
+  const [bitgetPositionMode, setBitgetPositionMode] =
+    useState<BitgetPositionMode>('hedge')
 
   // 安全输入状态
   const [secureInputTarget, setSecureInputTarget] = useState<
@@ -154,6 +161,11 @@ export function ExchangeConfigModal({
       setLighterWalletAddr(selectedExchange.lighterWalletAddr || '')
       setLighterApiKeyPrivateKey('') // Don't load existing API key for security
       setLighterApiKeyIndex(selectedExchange.lighterApiKeyIndex || 0)
+
+      // Bitget 持仓模式：缺省（旧数据）按 hedge 处理
+      setBitgetPositionMode(
+        selectedExchange.bitgetPositionMode === 'one_way' ? 'one_way' : 'hedge'
+      )
     }
   }, [editingExchangeId, selectedExchange])
 
@@ -289,10 +301,44 @@ export function ExchangeConfigModal({
         await onSave(exchangeId, exchangeType, trimmedAccountName, apiKey.trim(), secretKey.trim(), passphrase.trim(), testnet)
       } else if (currentExchangeType === 'bitget') {
         if (!apiKey.trim() || !secretKey.trim() || !passphrase.trim()) return
-        await onSave(exchangeId, exchangeType, trimmedAccountName, apiKey.trim(), secretKey.trim(), passphrase.trim(), testnet)
+        await onSave(
+          exchangeId,
+          exchangeType,
+          trimmedAccountName,
+          apiKey.trim(),
+          secretKey.trim(),
+          passphrase.trim(),
+          testnet,
+          undefined, // hyperliquidWalletAddr
+          undefined, // asterUser
+          undefined, // asterSigner
+          undefined, // asterPrivateKey
+          undefined, // lighterWalletAddr
+          undefined, // lighterPrivateKey
+          undefined, // lighterApiKeyPrivateKey
+          undefined, // lighterApiKeyIndex
+          bitgetPositionMode
+        )
       } else if (currentExchangeType === 'bitget_paper') {
-        // 本地模拟交易所：不需要任何密钥
-        await onSave(exchangeId, exchangeType, trimmedAccountName, '', '', '', false)
+        // 本地模拟交易所：不需要任何密钥，只需要持仓模式
+        await onSave(
+          exchangeId,
+          exchangeType,
+          trimmedAccountName,
+          '',
+          '',
+          '',
+          false,
+          undefined, // hyperliquidWalletAddr
+          undefined, // asterUser
+          undefined, // asterSigner
+          undefined, // asterPrivateKey
+          undefined, // lighterWalletAddr
+          undefined, // lighterPrivateKey
+          undefined, // lighterApiKeyPrivateKey
+          undefined, // lighterApiKeyIndex
+          bitgetPositionMode
+        )
       } else if (currentExchangeType === 'hyperliquid') {
         if (!apiKey.trim() || !hyperliquidWalletAddr.trim()) return // 验证私钥和钱包地址
         await onSave(
@@ -349,6 +395,42 @@ export function ExchangeConfigModal({
       setIsSaving(false)
     }
   }
+
+  // Bitget / Bitget Paper 持仓模式选择器（双向持仓 / 单向持仓）
+  const bitgetPositionModeSelector = (
+    <div
+      className="p-3 rounded space-y-2"
+      style={{ background: '#0B0E11', border: '1px solid #2B3139' }}
+      data-testid="bitget-position-mode"
+    >
+      <label
+        htmlFor="bitget-position-mode-select"
+        className="block text-sm font-semibold"
+        style={{ color: '#EAECEF' }}
+      >
+        {t('bitgetPositionMode', language)}
+      </label>
+      <select
+        id="bitget-position-mode-select"
+        value={bitgetPositionMode}
+        onChange={(e) =>
+          setBitgetPositionMode(e.target.value === 'one_way' ? 'one_way' : 'hedge')
+        }
+        className="w-full px-3 py-2 rounded"
+        style={{
+          background: '#1E2329',
+          border: '1px solid #2B3139',
+          color: '#EAECEF',
+        }}
+      >
+        <option value="hedge">{t('bitgetPositionModeHedge', language)}</option>
+        <option value="one_way">{t('bitgetPositionModeOneWay', language)}</option>
+      </select>
+      <div className="text-xs" style={{ color: '#848E9C' }}>
+        {t('bitgetPositionModeDescription', language)}
+      </div>
+    </div>
+  )
 
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4 overflow-y-auto">
@@ -525,6 +607,11 @@ export function ExchangeConfigModal({
                   >
                     {t('bitgetPaperDescription', language)}
                   </div>
+                )}
+
+                {/* Bitget Paper：持仓模式（无密钥表单，所以放在说明下面） */}
+                {currentExchangeType === 'bitget_paper' && (
+                  <div className="mt-3">{bitgetPositionModeSelector}</div>
                 )}
 
                 {/* 注册链接 */}
@@ -765,6 +852,10 @@ export function ExchangeConfigModal({
                           </span>
                         </label>
                       )}
+
+                      {/* Bitget 持仓模式 */}
+                      {currentExchangeType === 'bitget' &&
+                        bitgetPositionModeSelector}
 
                       {/* Binance 白名单IP提示 */}
                       {currentExchangeType === 'binance' && (

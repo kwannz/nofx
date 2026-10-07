@@ -717,7 +717,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
     lighterWalletAddr?: string,
     lighterPrivateKey?: string,
     lighterApiKeyPrivateKey?: string,
-    lighterApiKeyIndex?: number
+    lighterApiKeyIndex?: number,
+    bitgetPositionMode?: 'hedge' | 'one_way'
   ) => {
     try {
       if (exchangeId) {
@@ -744,6 +745,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
               lighter_private_key: lighterPrivateKey || '',
               lighter_api_key_private_key: lighterApiKeyPrivateKey || '',
               lighter_api_key_index: lighterApiKeyIndex || 0,
+              // 只有 Bitget / Bitget Paper 会传；未传时后端保持原值
+              bitget_position_mode: bitgetPositionMode,
             },
           },
         }
@@ -771,6 +774,7 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
           lighter_private_key: lighterPrivateKey || '',
           lighter_api_key_private_key: lighterApiKeyPrivateKey || '',
           lighter_api_key_index: lighterApiKeyIndex || 0,
+          bitget_position_mode: bitgetPositionMode,
         }
 
         await toast.promise(api.createExchangeEncrypted(createRequest), {
