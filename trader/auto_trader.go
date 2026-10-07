@@ -43,6 +43,7 @@ type AutoTraderConfig struct {
 	BitgetAPIKey    string
 	BitgetSecretKey string
 	BitgetPassphrase string
+	BitgetTestnet    bool // Use Bitget Demo trading (paptrading header)
 
 	// Hyperliquid configuration
 	HyperliquidPrivateKey string
@@ -232,7 +233,7 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 		trader = NewOKXTrader(config.OKXAPIKey, config.OKXSecretKey, config.OKXPassphrase)
 	case "bitget":
 		logger.Infof("🏦 [%s] Using Bitget Futures trading", config.Name)
-		trader = NewBitgetTrader(config.BitgetAPIKey, config.BitgetSecretKey, config.BitgetPassphrase)
+		trader = NewBitgetTraderWithOptions(config.BitgetAPIKey, config.BitgetSecretKey, config.BitgetPassphrase, config.BitgetTestnet)
 	case "hyperliquid":
 		logger.Infof("🏦 [%s] Using Hyperliquid trading", config.Name)
 		trader, err = NewHyperliquidTrader(config.HyperliquidPrivateKey, config.HyperliquidWalletAddr, config.HyperliquidTestnet)

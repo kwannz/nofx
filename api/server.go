@@ -607,10 +607,11 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 				string(exchangeCfg.Passphrase),
 			)
 		case "bitget":
-			tempTrader = trader.NewBitgetTrader(
+			tempTrader = trader.NewBitgetTraderWithOptions(
 				string(exchangeCfg.APIKey),
 				string(exchangeCfg.SecretKey),
 				string(exchangeCfg.Passphrase),
+				exchangeCfg.Testnet,
 			)
 		case "lighter":
 			if exchangeCfg.LighterWalletAddr != "" && string(exchangeCfg.LighterAPIKeyPrivateKey) != "" {
@@ -1151,10 +1152,11 @@ func (s *Server) handleSyncBalance(c *gin.Context) {
 			string(exchangeCfg.Passphrase),
 		)
 	case "bitget":
-		tempTrader = trader.NewBitgetTrader(
+		tempTrader = trader.NewBitgetTraderWithOptions(
 			string(exchangeCfg.APIKey),
 			string(exchangeCfg.SecretKey),
 			string(exchangeCfg.Passphrase),
+			exchangeCfg.Testnet,
 		)
 	case "lighter":
 		if exchangeCfg.LighterWalletAddr != "" && string(exchangeCfg.LighterAPIKeyPrivateKey) != "" {
@@ -1303,10 +1305,11 @@ func (s *Server) handleClosePosition(c *gin.Context) {
 			string(exchangeCfg.Passphrase),
 		)
 	case "bitget":
-		tempTrader = trader.NewBitgetTrader(
+		tempTrader = trader.NewBitgetTraderWithOptions(
 			string(exchangeCfg.APIKey),
 			string(exchangeCfg.SecretKey),
 			string(exchangeCfg.Passphrase),
+			exchangeCfg.Testnet,
 		)
 	case "lighter":
 		if exchangeCfg.LighterWalletAddr != "" && string(exchangeCfg.LighterAPIKeyPrivateKey) != "" {

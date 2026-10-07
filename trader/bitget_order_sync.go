@@ -3,8 +3,8 @@ package trader
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"nofx/logger"
-	"nofx/market"
 	"nofx/store"
 	"sort"
 	"strconv"
@@ -28,95 +28,164 @@ type BitgetTrade struct {
 	OrderAction string // open_long, open_short, close_long, close_short
 }
 
-// GetTrades retrieves trade/fill records from Bitget
-func (t *BitgetTrader) GetTrades(startTime time.Time, limit int) ([]BitgetTrade, error) {
-	if limit <= 0 {
-		limit = 100
+// bitgetFillMaxPages bounds fill-history pagination per sync run
+const bitgetFillMaxPages = 10
+
+// classifyBitgetFill determines the order action (open_long/open_short/close_long/close_short)
+// from a fill's side, tradeSide and realized profit.
+//
+// Hedge mode reports tradeSide=open|close (and reduce_close_long, burst_close_short, ...);
+// one-way mode reports buy_single|sell_single, where a non-zero realized profit means the
+// fill reduced a position. Prefixes reduce_/burst_/offset_/delivery_/dte_ and "close" are closes.
+func classifyBitgetFill(side, tradeSide string, profit float64) string {
+	side = strings.ToLower(side)
+	ts := strings.ToLower(tradeSide)
+
+	openBySide := func() string {
+		if side == "buy" {
+			return "open_long"
+		}
+		return "open_short"
 	}
-	if limit > 100 {
+	// A closing sell reduces a long; a closing buy reduces a short.
+	closeBySide := func() string {
+		if side == "sell" {
+			return "close_long"
+		}
+		return "close_short"
+	}
+
+	switch {
+	case ts == "open":
+		return openBySide()
+	case ts == "close":
+		return closeBySide()
+	case strings.HasSuffix(ts, "_long") && isBitgetCloseTradeSide(ts):
+		return "close_long"
+	case strings.HasSuffix(ts, "_short") && isBitgetCloseTradeSide(ts):
+		return "close_short"
+	case isBitgetCloseTradeSide(ts):
+		return closeBySide()
+	case ts == "buy_single" || ts == "sell_single":
+		if profit != 0 {
+			return closeBySide()
+		}
+		return openBySide()
+	}
+	// Unknown tradeSide: fall back to realized profit
+	if profit != 0 {
+		return closeBySide()
+	}
+	return openBySide()
+}
+
+func isBitgetCloseTradeSide(ts string) bool {
+	if strings.Contains(ts, "close") {
+		return true
+	}
+	for _, p := range []string{"reduce_", "burst_", "offset_", "delivery_", "dte_"} {
+		if strings.HasPrefix(ts, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// GetTrades retrieves trade/fill records from Bitget (fill-history, paginated with idLessThan,
+// up to bitgetFillMaxPages pages of `limit` records each)
+func (t *BitgetTrader) GetTrades(startTime time.Time, limit int) ([]BitgetTrade, error) {
+	if limit <= 0 || limit > 100 {
 		limit = 100 // Bitget max limit is 100
 	}
 
-	params := map[string]interface{}{
-		"productType": "USDT-FUTURES",
-		"startTime":   fmt.Sprintf("%d", startTime.UnixMilli()),
-		"limit":       fmt.Sprintf("%d", limit),
-	}
+	endTime := time.Now().UnixMilli()
+	idLessThan := ""
+	trades := make([]BitgetTrade, 0, limit)
 
-	data, err := t.doRequest("GET", "/api/v2/mix/order/fill-history", params)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get fill history: %w", err)
-	}
-
-	var resp struct {
-		FillList []struct {
-			TradeID    string `json:"tradeId"`
-			Symbol     string `json:"symbol"`
-			OrderID    string `json:"orderId"`
-			Side       string `json:"side"`       // buy, sell
-			Price      string `json:"price"`      // Fill price
-			BaseVolume string `json:"baseVolume"` // Fill size in base currency
-			Fee        string `json:"fee"`        // Fee (negative for cost)
-			FeeCcy     string `json:"feeCcy"`     // Fee currency
-			Profit     string `json:"profit"`     // Realized PnL
-			CTime      string `json:"cTime"`      // Fill time (ms)
-			TradeSide  string `json:"tradeSide"`  // open, close
-		} `json:"fillList"`
-	}
-
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return nil, fmt.Errorf("failed to parse fills: %w", err)
-	}
-
-	trades := make([]BitgetTrade, 0, len(resp.FillList))
-
-	for _, fill := range resp.FillList {
-		fillPrice, _ := strconv.ParseFloat(fill.Price, 64)
-		fillQty, _ := strconv.ParseFloat(fill.BaseVolume, 64)
-		fee, _ := strconv.ParseFloat(fill.Fee, 64)
-		profit, _ := strconv.ParseFloat(fill.Profit, 64)
-		cTime, _ := strconv.ParseInt(fill.CTime, 10, 64)
-
-		// Determine order action based on side and tradeSide
-		// Bitget one-way mode:
-		// - buy + open = open long
-		// - sell + open = open short
-		// - sell + close = close long
-		// - buy + close = close short
-		orderAction := "open_long"
-		side := strings.ToLower(fill.Side)
-		tradeSide := strings.ToLower(fill.TradeSide)
-
-		if tradeSide == "open" {
-			if side == "buy" {
-				orderAction = "open_long"
-			} else {
-				orderAction = "open_short"
-			}
-		} else if tradeSide == "close" {
-			if side == "sell" {
-				orderAction = "close_long"
-			} else {
-				orderAction = "close_short"
-			}
+	for page := 0; page < bitgetFillMaxPages; page++ {
+		params := map[string]interface{}{
+			"productType": bitgetProductType,
+			"startTime":   fmt.Sprintf("%d", startTime.UnixMilli()),
+			"endTime":     fmt.Sprintf("%d", endTime),
+			"limit":       fmt.Sprintf("%d", limit),
+		}
+		if idLessThan != "" {
+			params["idLessThan"] = idLessThan
 		}
 
-		trade := BitgetTrade{
-			Symbol:      fill.Symbol,
-			TradeID:     fill.TradeID,
-			OrderID:     fill.OrderID,
-			Side:        fill.Side,
-			FillPrice:   fillPrice,
-			FillQty:     fillQty,
-			Fee:         -fee, // Bitget returns negative fee
-			FeeAsset:    fill.FeeCcy,
-			ExecTime:    time.UnixMilli(cTime).UTC(),
-			ProfitLoss:  profit,
-			OrderType:   "MARKET",
-			OrderAction: orderAction,
+		data, err := t.doRequest("GET", bitgetFillHistoryPath, params)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get fill history: %w", err)
 		}
 
-		trades = append(trades, trade)
+		var resp struct {
+			FillList []struct {
+				TradeID    string `json:"tradeId"`
+				Symbol     string `json:"symbol"`
+				OrderID    string `json:"orderId"`
+				Side       string `json:"side"`
+				Price      string `json:"price"`
+				BaseVolume string `json:"baseVolume"`
+				Fee        string `json:"fee"` // legacy field, feeDetail preferred
+				Profit     string `json:"profit"`
+				CTime      string `json:"cTime"`
+				TradeSide  string `json:"tradeSide"`
+				FeeDetail  []struct {
+					FeeCoin  string `json:"feeCoin"`
+					TotalFee string `json:"totalFee"`
+				} `json:"feeDetail"`
+			} `json:"fillList"`
+			EndID string `json:"endId"`
+		}
+		if err := json.Unmarshal(data, &resp); err != nil {
+			return nil, fmt.Errorf("failed to parse fills: %w", err)
+		}
+
+		for _, fill := range resp.FillList {
+			fillPrice, _ := strconv.ParseFloat(fill.Price, 64)
+			fillQty, _ := strconv.ParseFloat(fill.BaseVolume, 64)
+			profit, _ := strconv.ParseFloat(fill.Profit, 64)
+			cTime, _ := strconv.ParseInt(fill.CTime, 10, 64)
+
+			// Fees are negative costs in feeDetail[].totalFee; sum absolute values
+			fee := 0.0
+			feeAsset := ""
+			for _, fd := range fill.FeeDetail {
+				v, _ := strconv.ParseFloat(fd.TotalFee, 64)
+				fee += math.Abs(v)
+				if feeAsset == "" {
+					feeAsset = fd.FeeCoin
+				}
+			}
+			if len(fill.FeeDetail) == 0 {
+				v, _ := strconv.ParseFloat(fill.Fee, 64)
+				fee = math.Abs(v)
+			}
+			if feeAsset == "" {
+				feeAsset = "USDT"
+			}
+
+			trades = append(trades, BitgetTrade{
+				Symbol:      strings.ToUpper(fill.Symbol),
+				TradeID:     fill.TradeID,
+				OrderID:     fill.OrderID,
+				Side:        fill.Side,
+				FillPrice:   fillPrice,
+				FillQty:     fillQty,
+				Fee:         fee,
+				FeeAsset:    feeAsset,
+				ExecTime:    time.UnixMilli(cTime).UTC(),
+				ProfitLoss:  profit,
+				OrderType:   "MARKET",
+				OrderAction: classifyBitgetFill(fill.Side, fill.TradeSide, profit),
+			})
+		}
+
+		// Stop when there is no cursor, no data, or the cursor did not advance
+		if resp.EndID == "" || len(resp.FillList) == 0 || resp.EndID == idLessThan {
+			break
+		}
+		idLessThan = resp.EndID
 	}
 
 	return trades, nil
@@ -162,8 +231,8 @@ func (t *BitgetTrader) SyncOrdersFromBitget(traderID string, exchangeID string, 
 			continue // Order already exists, skip
 		}
 
-		// Normalize symbol
-		symbol := market.Normalize(trade.Symbol)
+		// Keep the native Bitget symbol (market.Normalize would map e.g. NVDAUSDT to xyz:NVDA)
+		symbol := strings.ToUpper(trade.Symbol)
 
 		// Determine position side from order action
 		positionSide := "LONG"

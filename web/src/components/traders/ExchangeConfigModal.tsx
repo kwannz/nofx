@@ -713,6 +713,38 @@ export function ExchangeConfigModal({
                         </div>
                       )}
 
+                      {/* Bitget Demo (paptrading) 开关 */}
+                      {currentExchangeType === 'bitget' && (
+                        <label
+                          className="flex items-start gap-3 cursor-pointer p-3 rounded"
+                          style={{
+                            background: '#0B0E11',
+                            border: '1px solid #2B3139',
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={testnet}
+                            onChange={(e) => setTestnet(e.target.checked)}
+                            className="mt-1"
+                          />
+                          <span>
+                            <span
+                              className="block text-sm font-semibold"
+                              style={{ color: '#EAECEF' }}
+                            >
+                              {t('bitgetDemoMode', language)}
+                            </span>
+                            <span
+                              className="block text-xs mt-1"
+                              style={{ color: '#848E9C' }}
+                            >
+                              {t('bitgetDemoDescription', language)}
+                            </span>
+                          </span>
+                        </label>
+                      )}
+
                       {/* Binance 白名单IP提示 */}
                       {currentExchangeType === 'binance' && (
                         <div

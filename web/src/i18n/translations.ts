@@ -438,6 +438,9 @@ export const translations = {
       'Invalid private key format. Expected {length} hexadecimal characters (optional 0x prefix).',
     testnetDescription:
       'Enable to connect to exchange test environment for simulated trading',
+    bitgetDemoMode: 'Demo trading (paptrading)',
+    bitgetDemoDescription:
+      'Use a Bitget Demo API key and trade with simulated funds. Real API keys will be rejected in this mode.',
     securityWarning: 'Security Warning',
     saveConfiguration: 'Save Configuration',
 
@@ -1630,6 +1633,9 @@ export const translations = {
     twoStageInvalidFormat:
       '私钥格式不正确，应为 {length} 位十六进制字符（可选 0x 前缀）。',
     testnetDescription: '启用后将连接到交易所测试环境,用于模拟交易',
+    bitgetDemoMode: 'Demo 模拟交易 (paptrading)',
+    bitgetDemoDescription:
+      '使用 Bitget Demo API Key，以模拟资金交易。该模式下真实 API Key 会被拒绝。',
     securityWarning: '安全提示',
     saveConfiguration: '保存配置',
 
