@@ -139,7 +139,7 @@ sudo apt-get install libta-lib0-dev
 ### 5. Test Your Changes
 
 ```bash
-# Run backend tests (hermetic: no network, no API keys needed)
+# Run backend tests (no API keys needed; live-network tests are opt-in, see below)
 go test ./...
 
 # Build backend
@@ -155,9 +155,13 @@ npm run build
 
 #### Live-network tests (`NOFX_LIVE_TESTS=1`)
 
-CI runs `go test -race ./...` without `-short`, so the default test run must be
-hermetic. Tests that call real exchanges, data providers or LLM endpoints
-(Bitget, CoinAnk, Alpaca, Hyperliquid public API, Qwen, ...) are **skipped
+CI runs `go test -race ./...` without `-short`, so the default test run should
+not depend on the network: new tests must use mock servers (`httptest`) or the
+production hooks to avoid real endpoints. A few older tests (for example some
+Bybit and Hyperliquid trader tests) still reach the real exchange while a
+trader is constructed and may fail offline; they are being converted to mocks,
+so do not add more like them. Tests that call real exchanges, data providers or
+LLM endpoints (Bitget, CoinAnk, Alpaca, Hyperliquid public API, Qwen, ...) are **skipped
 unless `NOFX_LIVE_TESTS=1`** is set.
 
 ```bash

@@ -6,8 +6,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"nofx/hook"
 
 	"github.com/adshao/go-binance/v2/futures"
 	"github.com/stretchr/testify/assert"
@@ -315,11 +318,26 @@ func TestFuturesTrader_CommonInterface(t *testing.T) {
 // 3. Binance Futures specific unit tests
 // ============================================================
 
-// TestNewFuturesTrader tests creating Binance Futures trader
+// TestNewFuturesTrader tests creating Binance Futures trader.
+//
+// NewFuturesTrader talks to Binance during construction (server time sync and
+// hedge-mode switch), so the mock server has to be wired in BEFORE the
+// constructor runs. We do that through the production NEW_BINANCE_TRADER hook,
+// which lets the caller replace the futures client. This keeps the test
+// hermetic: nothing in it can reach the real Binance endpoint.
 func TestNewFuturesTrader(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		requests []string
+	)
+
 	// Create mock HTTP server
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
+
+		mu.Lock()
+		requests = append(requests, r.Method+" "+path)
+		mu.Unlock()
 
 		var respBody interface{}
 
@@ -342,16 +360,44 @@ func TestNewFuturesTrader(t *testing.T) {
 	}))
 	defer mockServer.Close()
 
+	// Point the futures client at the mock server before the constructor makes
+	// its first request. Hooks are process-global, so restore the previous
+	// state when the test ends.
+	prevHook, hadHook := hook.Hooks[hook.NEW_BINANCE_TRADER]
+	prevEnabled := hook.EnableHooks
+	hook.EnableHooks = true
+	hook.RegisterHook(hook.NEW_BINANCE_TRADER, func(args ...any) any {
+		client := args[1].(*futures.Client)
+		client.BaseURL = mockServer.URL
+		client.HTTPClient = mockServer.Client()
+		return &hook.NewBinanceTraderResult{Client: client}
+	})
+	t.Cleanup(func() {
+		hook.EnableHooks = prevEnabled
+		if hadHook {
+			hook.Hooks[hook.NEW_BINANCE_TRADER] = prevHook
+		} else {
+			delete(hook.Hooks, hook.NEW_BINANCE_TRADER)
+		}
+	})
+
 	// Test successful creation
 	trader := NewFuturesTrader("test_api_key", "test_secret_key", "test_user")
-
-	// Modify client to use mock server
-	trader.client.BaseURL = mockServer.URL
-	trader.client.HTTPClient = mockServer.Client()
 
 	assert.NotNil(t, trader)
 	assert.NotNil(t, trader.client)
 	assert.Equal(t, 15*time.Second, trader.cacheDuration)
+
+	// The client must still be the mock one, and construction must have issued
+	// exactly its two startup calls against it (and nowhere else).
+	assert.Equal(t, mockServer.URL, trader.client.BaseURL)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{
+		"GET /fapi/v1/time",
+		"POST /fapi/v1/positionSide/dual",
+	}, requests)
+	assert.NotZero(t, trader.client.TimeOffset, "server time should have been synced from the mock")
 }
 
 // TestCalculatePositionSize tests position size calculation
