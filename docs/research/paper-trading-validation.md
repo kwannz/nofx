@@ -177,7 +177,6 @@
 |---|---|
 | `close_reason` 不够细 | 模拟盘止盈止损平仓在 DB 中的 `close_reason` 记为通用的 `sync`；具体原因只在日志和订单记录里 |
 | 美国节假日 | 交易时段日历没有建模美国市场假日 |
-| 文档滞后 | `docs/bitget-paper-trading.md` 的「落盘与重启恢复」一节仍写快照 `"version": 1`，而代码当前为 v2（兼容读取 v1）。本次按要求没有修改该文件，建议后续同步 |
 | 原有测试失败（与本工作无关） | kernel 的 `TestDataDictionary`、`TestTradingRules`；manager 的 `TestRemoveTrader`（空指针）；trader 的 `TestBybitTrader_FormatQuantity`、`TestNewHyperliquidTrader`（需联网） |
 | 原有构建问题 | `go build ./...` 在 `scripts/` 下失败（多个 `main`），在本工作之前就存在 |
 | 样本量 | 约 2 小时、两个交易员，不足以评价策略或模型的收益、回撤和风险 |
@@ -224,4 +223,4 @@ BITGET_DEMO_API_KEY=... BITGET_DEMO_SECRET_KEY=... BITGET_DEMO_PASSPHRASE=... \
 | 高 | 在 Bitget 策略中关闭已失效的 nofxos 指标，或更换有效的 Key，去掉每周期约 5 秒的开销 |
 | 中 | 把模拟盘止盈止损的平仓原因写入 `close_reason`，替代通用的 `sync` |
 | 中 | 延长运行时间并覆盖一个完整的资金费率结算边界、一次休市 → 开市切换，以及一次止损触发 |
-| 低 | 建模美国市场假日；同步 `docs/bitget-paper-trading.md` 的快照版本说明 |
+| 低 | 建模美国市场假日 |
