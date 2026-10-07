@@ -110,6 +110,9 @@ func (tm *TraderManager) StartAll() {
 
 	logger.Info("🚀 Starting all traders...")
 	for id, t := range tm.traders {
+		if t == nil {
+			continue
+		}
 		go func(traderID string, at *trader.AutoTrader) {
 			logger.Infof("▶️  Starting %s...", at.GetName())
 			if err := at.Run(); err != nil {
@@ -126,6 +129,9 @@ func (tm *TraderManager) StopAll() {
 
 	logger.Info("⏹  Stopping all traders...")
 	for _, t := range tm.traders {
+		if t == nil {
+			continue
+		}
 		t.Stop()
 	}
 }
@@ -157,6 +163,9 @@ func (tm *TraderManager) AutoStartRunningTraders(st *store.Store) {
 
 	startedCount := 0
 	for id, t := range tm.traders {
+		if t == nil {
+			continue
+		}
 		if runningTraderIDs[id] {
 			go func(traderID string, at *trader.AutoTrader) {
 				logger.Infof("▶️  Auto-restoring %s...", at.GetName())
@@ -182,6 +191,9 @@ func (tm *TraderManager) GetComparisonData() (map[string]interface{}, error) {
 	traders := make([]map[string]interface{}, 0, len(tm.traders))
 
 	for _, t := range tm.traders {
+		if t == nil {
+			continue
+		}
 		account, err := t.GetAccountInfo()
 		if err != nil {
 			continue
@@ -231,6 +243,9 @@ func (tm *TraderManager) GetCompetitionData() (map[string]interface{}, error) {
 	// Get all trader list (only those with ShowInCompetition = true)
 	allTraders := make([]*trader.AutoTrader, 0, len(tm.traders))
 	for id, t := range tm.traders {
+		if t == nil {
+			continue
+		}
 		if t.GetShowInCompetition() {
 			allTraders = append(allTraders, t)
 			logger.Infof("📋 Competition data includes trader: %s (%s)", t.GetName(), id)
@@ -416,11 +431,14 @@ func (tm *TraderManager) RemoveTrader(traderID string) {
 	defer tm.mu.Unlock()
 
 	if t, exists := tm.traders[traderID]; exists {
-		// Stop the trader if it's running (this ensures the goroutine exits)
-		status := t.GetStatus()
-		if isRunning, ok := status["is_running"].(bool); ok && isRunning {
-			logger.Infof("⏹ Stopping trader %s before removing from memory...", traderID)
-			t.Stop()
+		// Stop the trader if it's running (this ensures the goroutine exits).
+		// A nil entry has nothing to stop and is simply dropped from the map.
+		if t != nil {
+			status := t.GetStatus()
+			if isRunning, ok := status["is_running"].(bool); ok && isRunning {
+				logger.Infof("⏹ Stopping trader %s before removing from memory...", traderID)
+				t.Stop()
+			}
 		}
 		delete(tm.traders, traderID)
 		logger.Infof("✓ Trader %s removed from memory", traderID)

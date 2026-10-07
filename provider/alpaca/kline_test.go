@@ -7,6 +7,7 @@ import (
 )
 
 func TestGetBars(t *testing.T) {
+	requireLiveTests(t)
 	client := NewClient()
 
 	resp, err := client.GetBars(context.TODO(), "AAPL", "1Day", 5)

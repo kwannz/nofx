@@ -8,6 +8,7 @@ import (
 )
 
 func TestListCoin(t *testing.T) {
+	requireLiveTests(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.ListCoin(context.TODO(), "SPOT")
 	if err != nil {
@@ -21,6 +22,7 @@ func TestListCoin(t *testing.T) {
 }
 
 func TestListSymbols(t *testing.T) {
+	requireLiveTests(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.ListSymbols(context.TODO(), "Binance", "SWAP")
 	if err != nil {

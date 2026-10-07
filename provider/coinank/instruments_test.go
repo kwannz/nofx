@@ -8,6 +8,7 @@ import (
 )
 
 func TestGetLastPrice(t *testing.T) {
+	requireLiveTests(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.GetLastPrice(context.TODO(), "BTCUSDT", "Binance", "SWAP")
 	if err != nil {
@@ -21,6 +22,7 @@ func TestGetLastPrice(t *testing.T) {
 }
 
 func TestGetCoinMarketCap(t *testing.T) {
+	requireLiveTests(t)
 	client := NewCoinankClient(coinank_enum.MainUrl, TestApikey)
 	resp, err := client.GetCoinMarketCap(context.TODO(), "BTC")
 	if err != nil {
