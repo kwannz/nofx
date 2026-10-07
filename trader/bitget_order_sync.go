@@ -23,6 +23,7 @@ type BitgetTrade struct {
 	Fee         float64
 	FeeAsset    string
 	ExecTime    time.Time
+	IsMaker     bool // tradeScope == "maker"
 	ProfitLoss  float64
 	OrderType   string
 	OrderAction string // open_long, open_short, close_long, close_short
@@ -33,15 +34,19 @@ type BitgetTrade struct {
 	ActionAmbiguous bool
 }
 
-// bitgetFillMaxPages bounds fill-history pagination per sync run
+// bitgetFillMaxPages bounds fills pagination per sync run
 const bitgetFillMaxPages = 10
 
 // classifyBitgetFill determines the order action (open_long/open_short/close_long/close_short)
 // from a fill's side, tradeSide and realized profit alone (position-blind).
 //
 // Hedge mode reports tradeSide=open|close (and reduce_close_long, burst_close_short, ...);
-// one-way mode reports buy_single|sell_single, where a non-zero realized profit means the
-// fill reduced a position. Prefixes reduce_/burst_/offset_/delivery_/dte_ and "close" are closes.
+// there `side` names the POSITION direction, not the order direction: buy+open opens a long,
+// sell+open opens a short, buy+close closes a long, sell+close closes a short (verified on real
+// Bitget fills: a hedge "buy"/"close" fill with profit 2.29028 = (84507.9-83769.1)*0.0031 closed
+// a long opened at 83769.1). One-way mode reports buy_single|sell_single, where a non-zero
+// realized profit means the fill reduced a position and `side` is the real order direction (a
+// sell reduces a long). Prefixes reduce_/burst_/offset_/delivery_/dte_ and "close" are closes.
 //
 // A one-way fill with zero profit is ambiguous (open, or a break-even close); this function
 // reports it as an open. Use classifyBitgetFillWithPositions to resolve it.
@@ -63,9 +68,16 @@ func classifyBitgetFillDetailed(side, tradeSide string, profit float64) (action 
 		}
 		return "open_short"
 	}
-	// A closing sell reduces a long; a closing buy reduces a short.
+	// One-way: a closing sell reduces a long; a closing buy reduces a short.
 	closeBySide := func() string {
 		if side == "sell" {
+			return "close_long"
+		}
+		return "close_short"
+	}
+	// Hedge: side is the position direction (buy = long position).
+	hedgeCloseBySide := func() string {
+		if side == "buy" {
 			return "close_long"
 		}
 		return "close_short"
@@ -75,7 +87,7 @@ func classifyBitgetFillDetailed(side, tradeSide string, profit float64) (action 
 	case ts == "open":
 		return openBySide(), false
 	case ts == "close":
-		return closeBySide(), false
+		return hedgeCloseBySide(), false
 	case strings.HasSuffix(ts, "_long") && isBitgetCloseTradeSide(ts):
 		return "close_long", false
 	case strings.HasSuffix(ts, "_short") && isBitgetCloseTradeSide(ts):
@@ -133,8 +145,8 @@ func isBitgetCloseTradeSide(ts string) bool {
 	return false
 }
 
-// GetTrades retrieves trade/fill records from Bitget (fill-history, paginated with idLessThan,
-// up to bitgetFillMaxPages pages of `limit` records each)
+// GetTrades retrieves trade/fill records from Bitget (/api/v2/mix/order/fills, newest first,
+// paginated with idLessThan=endId, up to bitgetFillMaxPages pages of `limit` records each)
 func (t *BitgetTrader) GetTrades(startTime time.Time, limit int) ([]BitgetTrade, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 100 // Bitget max limit is 100
@@ -155,9 +167,9 @@ func (t *BitgetTrader) GetTrades(startTime time.Time, limit int) ([]BitgetTrade,
 			params["idLessThan"] = idLessThan
 		}
 
-		data, err := t.doRequest("GET", bitgetFillHistoryPath, params)
+		data, err := t.doRequest("GET", bitgetFillsPath, params)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get fill history: %w", err)
+			return nil, fmt.Errorf("failed to get fills: %w", err)
 		}
 
 		var resp struct {
@@ -172,6 +184,7 @@ func (t *BitgetTrader) GetTrades(startTime time.Time, limit int) ([]BitgetTrade,
 				Profit     string `json:"profit"`
 				CTime      string `json:"cTime"`
 				TradeSide  string `json:"tradeSide"`
+				TradeScope string `json:"tradeScope"` // taker / maker
 				FeeDetail  []struct {
 					FeeCoin  string `json:"feeCoin"`
 					TotalFee string `json:"totalFee"`
@@ -218,6 +231,7 @@ func (t *BitgetTrader) GetTrades(startTime time.Time, limit int) ([]BitgetTrade,
 				Fee:         fee,
 				FeeAsset:    feeAsset,
 				ExecTime:    time.UnixMilli(cTime).UTC(),
+				IsMaker:     strings.EqualFold(fill.TradeScope, "maker"),
 				ProfitLoss:  profit,
 				OrderType:   "MARKET",
 				OrderAction: action,
@@ -351,7 +365,7 @@ func (t *BitgetTrader) SyncOrdersFromBitget(traderID string, exchangeID string, 
 			Commission:      trade.Fee,
 			CommissionAsset: trade.FeeAsset,
 			RealizedPnL:     trade.ProfitLoss,
-			IsMaker:         false,
+			IsMaker:         trade.IsMaker,
 			CreatedAt:       execTimeMs,
 		}
 

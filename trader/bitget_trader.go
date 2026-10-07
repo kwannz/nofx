@@ -40,7 +40,9 @@ const (
 	bitgetCancelPlanPath   = "/api/v2/mix/order/cancel-plan-order"
 	bitgetOrderDetailPath  = "/api/v2/mix/order/detail"
 	bitgetHistoryPosPath   = "/api/v2/mix/position/history-position"
-	bitgetFillHistoryPath  = "/api/v2/mix/order/fill-history"
+	// bitgetFillsPath lists trade fills. NOTE: /api/v2/mix/order/fill-history does NOT exist
+	// (verified on Bitget Demo: code 40404 "Request URL NOT FOUND"); /fills is the real endpoint.
+	bitgetFillsPath = "/api/v2/mix/order/fills"
 )
 
 // BitgetTrader Bitget futures trader
@@ -155,6 +157,10 @@ func bitgetErrorHint(code string) string {
 		return "trigger price is on the wrong side of the current price"
 	case "22002":
 		return "no position to close"
+	case "40099":
+		return "API key environment mismatch: demo key requires Demo mode (testnet toggle) and live keys must not enable it"
+	case "40404":
+		return "endpoint not found: the Bitget API path does not exist (API change or unsupported environment)"
 	}
 	return ""
 }
@@ -393,6 +399,20 @@ func (t *BitgetTrader) GetBalance() (map[string]interface{}, error) {
 	return result, nil
 }
 
+// sanitizeBitgetLiquidationPrice parses Bitget's liquidationPrice and maps "not applicable"
+// values to 0 (the convention used by the prompt schema: 0 = no liquidation risk).
+// Low-leverage cross positions report a huge negative price (verified on Demo:
+// "-279781303.08" for a 3x cross long), meaning the position cannot be liquidated by price;
+// such a number must never reach the AI prompt or a risk check. Empty, NaN, Inf and
+// non-positive values all become 0.
+func sanitizeBitgetLiquidationPrice(raw string) float64 {
+	v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
+		return 0
+	}
+	return v
+}
+
 // GetPositions gets all positions
 func (t *BitgetTrader) GetPositions() ([]map[string]interface{}, error) {
 	// Check cache
@@ -443,7 +463,7 @@ func (t *BitgetTrader) GetPositions() ([]map[string]interface{}, error) {
 		markPrice, _ := strconv.ParseFloat(pos.MarkPrice, 64)
 		unrealizedPnL, _ := strconv.ParseFloat(pos.UnrealizedPL, 64)
 		leverage, _ := strconv.ParseFloat(pos.Leverage, 64)
-		liqPrice, _ := strconv.ParseFloat(pos.LiquidationPrice, 64)
+		liqPrice := sanitizeBitgetLiquidationPrice(pos.LiquidationPrice)
 		cTime, _ := strconv.ParseInt(pos.CTime, 10, 64)
 		uTime, _ := strconv.ParseInt(pos.UTime, 10, 64)
 
@@ -863,13 +883,30 @@ func bitgetDirection(s string) string {
 	return ""
 }
 
-// planOrderDirection returns long/short for a plan order, or "" when unknown.
+// planOrderDirection returns the direction ("long"/"short") of the POSITION a TP/SL plan order
+// protects, or "" when it cannot be determined.
+//
+// Hedge mode reports posSide=long|short, which names the position directly. One-way mode
+// reports posSide="net" and side = the CLOSING side of the plan (verified on Bitget Demo:
+// a long's pos_loss/pos_profit has side "sell", a short's has side "buy"), so the position
+// direction is the opposite of side. Legacy holdSide (the place-tpsl-order request vocabulary:
+// buy = long position, sell = short position) is honored when present.
 func planOrderDirection(o bitgetPlanOrder) string {
+	switch strings.ToLower(o.PosSide) {
+	case "long":
+		return "long"
+	case "short":
+		return "short"
+	}
 	if d := bitgetDirection(o.HoldSide); d != "" {
 		return d
 	}
-	if d := bitgetDirection(o.PosSide); d != "" {
-		return d
+	// one-way ("net" or missing posSide): side is the closing side
+	switch strings.ToLower(o.Side) {
+	case "sell":
+		return "long"
+	case "buy":
+		return "short"
 	}
 	return ""
 }
@@ -982,8 +1019,29 @@ func roundBitgetPrice(c *BitgetContract, price float64) string {
 	return strconv.FormatFloat(v, 'f', c.PricePlace, 64)
 }
 
-// postTPSL sends one place-tpsl-order request for a whole-position SL/TP.
-func (t *BitgetTrader) postTPSL(symbol, planType, holdSide, trigger string) error {
+// placeTPSL places a whole-position stop loss / take profit via place-tpsl-order.
+//
+// place-tpsl-order is an UPSERT for pos_loss / pos_profit (verified on Bitget Demo): placing
+// one for a position that already has one of the same type replaces it in place (same
+// orderId, new trigger), and a rejected placement (e.g. 45122 "stop loss price must be above
+// mark price") leaves the existing order untouched. Cancelling first would only open an
+// unprotected window, so this deliberately does NOT cancel anything: it places the new
+// trigger and propagates the exchange error as-is. Use the Cancel* methods to remove orders.
+func (t *BitgetTrader) placeTPSL(symbol, positionSide string, price float64, planType, label string) error {
+	symbol = t.convertSymbol(symbol)
+
+	// holdSide uses the one-way vocabulary of place-tpsl-order: buy = long, sell = short
+	holdSide := "buy"
+	if strings.ToUpper(positionSide) == "SHORT" {
+		holdSide = "sell"
+	}
+
+	contract, err := t.getContract(symbol)
+	if err != nil {
+		return fmt.Errorf("failed to set %s: %w", label, err)
+	}
+	trigger := roundBitgetPrice(contract, price)
+
 	body := map[string]interface{}{
 		"marginCoin":   "USDT",
 		"productType":  bitgetProductType,
@@ -994,94 +1052,11 @@ func (t *BitgetTrader) postTPSL(symbol, planType, holdSide, trigger string) erro
 		"holdSide":     holdSide,
 		"clientOid":    genBitgetClientOid(),
 	}
-	_, err := t.doRequest("POST", bitgetPlaceTPSLPath, body)
-	return err
-}
-
-// placeTPSL places a whole-position stop loss / take profit via place-tpsl-order.
-//
-// Bitget may allow only one pos_loss / pos_profit per position, so the new order cannot be
-// placed before the old one is cancelled. The sequence is therefore cancel -> place, and when
-// the placement fails the previous trigger(s) are re-placed (best effort) so a live position
-// is not silently left without protection. The returned error says whether the restore worked.
-func (t *BitgetTrader) placeTPSL(symbol, positionSide string, price float64, planType, label string) error {
-	symbol = t.convertSymbol(symbol)
-
-	holdSide, direction := "buy", "long"
-	if strings.ToUpper(positionSide) == "SHORT" {
-		holdSide, direction = "sell", "short"
-	}
-
-	contract, err := t.getContract(symbol)
-	if err != nil {
+	if _, err := t.doRequest("POST", bitgetPlaceTPSLPath, body); err != nil {
 		return fmt.Errorf("failed to set %s: %w", label, err)
 	}
-	trigger := roundBitgetPrice(contract, price)
-
-	kind := bitgetKindSL
-	if planType == "pos_profit" {
-		kind = bitgetKindTP
-	}
-
-	// Remember the existing order(s) of this kind/side so they can be restored on failure.
-	existing, err := t.matchingPlanOrders(symbol, kind, direction)
-	if err != nil {
-		return fmt.Errorf("failed to clear existing %s before placing new one: %w", label, err)
-	}
-	// Replace any existing order of the same type on this side
-	if err := t.cancelPlanOrderIDs(symbol, planOrderIDs(existing)); err != nil {
-		return fmt.Errorf("failed to clear existing %s before placing new one: %w", label, err)
-	}
-
-	placeErr := t.postTPSL(symbol, planType, holdSide, trigger)
-	if placeErr == nil {
-		logger.Infof("  ✓ [Bitget] %s set: %s @ %s", label, symbol, trigger)
-		return nil
-	}
-	if len(existing) == 0 {
-		return fmt.Errorf("failed to set %s: %w", label, placeErr)
-	}
-
-	// The old order is already gone: try to put it back so the position stays protected.
-	restored, restoreErr := t.restoreTPSL(symbol, planType, holdSide, existing)
-	if restoreErr != nil {
-		logger.Errorf("  🚨 [Bitget] %s %s @ %s failed (%v) AND restoring the previous one failed (%v): position may be UNPROTECTED",
-			label, symbol, trigger, placeErr, restoreErr)
-		note := "NOT restored"
-		if len(restored) > 0 {
-			note = fmt.Sprintf("only partially restored (@ %s)", strings.Join(restored, ","))
-		}
-		return fmt.Errorf("failed to set %s: %w; previous %s %s (%v): position may be unprotected",
-			label, placeErr, label, note, restoreErr)
-	}
-	logger.Warnf("  ⚠️ [Bitget] %s %s @ %s failed (%v); previous %s restored @ %s",
-		label, symbol, trigger, placeErr, label, strings.Join(restored, ","))
-	return fmt.Errorf("failed to set %s: %w; previous %s restored @ %s",
-		label, placeErr, label, strings.Join(restored, ","))
-}
-
-// restoreTPSL re-places previously cancelled TP/SL plan orders (one per distinct trigger price).
-// It returns the trigger prices that were re-placed and the first error, if any.
-func (t *BitgetTrader) restoreTPSL(symbol, planType, holdSide string, prev []bitgetPlanOrder) ([]string, error) {
-	var restored []string
-	var errs []error
-	seen := map[string]bool{}
-	for _, o := range prev {
-		trig := strings.TrimSpace(o.TriggerPrice)
-		if trig == "" || seen[trig] {
-			continue
-		}
-		seen[trig] = true
-		if err := t.postTPSL(symbol, planType, holdSide, trig); err != nil {
-			errs = append(errs, fmt.Errorf("@%s: %w", trig, err))
-			continue
-		}
-		restored = append(restored, trig)
-	}
-	if len(restored) == 0 && len(errs) == 0 {
-		errs = append(errs, errors.New("previous order reported no trigger price"))
-	}
-	return restored, errors.Join(errs...)
+	logger.Infof("  ✓ [Bitget] %s set: %s @ %s", label, symbol, trigger)
+	return nil
 }
 
 // SetStopLoss sets a position stop loss (size is the whole position; quantity is unused)
@@ -1448,18 +1423,15 @@ func (t *BitgetTrader) GetOpenOrders(symbol string) ([]OpenOrder, error) {
 		if kind == bitgetKindTP {
 			typ = "TAKE_PROFIT_MARKET"
 		}
+		// PositionSide is the position the plan protects; Side is the order side that closes it
+		// (one-way: exactly the plan's own side, e.g. a long's SL is SELL / LONG).
 		dir := planOrderDirection(o)
-		if dir == "" {
-			// Fallback: treat plan side like holdSide (buy = long position)
-			dir = bitgetDirection(o.Side)
-		}
-		if dir == "" {
-			dir = "long"
-		}
 		posSide := strings.ToUpper(dir)
-		// Closing side is opposite of the position direction
-		closeSide := "SELL"
-		if dir == "short" {
+		closeSide := strings.ToUpper(o.Side)
+		switch dir {
+		case "long":
+			closeSide = "SELL"
+		case "short":
 			closeSide = "BUY"
 		}
 		result = append(result, OpenOrder{

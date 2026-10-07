@@ -43,7 +43,8 @@ func TestClassifyBitgetFillWithPositions(t *testing.T) {
 		{"profit still means close", "sell", "sell_single", 3, openSet(), "close_long"},
 		{"loss still means close", "buy", "buy_single", -3, openSet(), "close_short"},
 		{"hedge open stays open even with opposite position", "sell", "open", 0, openSet("BTCUSDT:LONG"), "open_short"},
-		{"hedge close", "sell", "close", 0, openSet(), "close_long"},
+		{"hedge close long (side is the position direction)", "buy", "close", 0, openSet(), "close_long"},
+		{"hedge close short", "sell", "close", 0, openSet(), "close_short"},
 		{"reduce_ prefix", "buy", "reduce_close_short", 0, openSet(), "close_short"},
 		{"burst_ prefix", "sell", "burst_close_long", 0, openSet(), "close_long"},
 		{"offset_ prefix", "sell", "offset_close_long", 0, openSet(), "close_long"},
@@ -72,7 +73,8 @@ func TestClassifyBitgetFillAmbiguityFlag(t *testing.T) {
 		{"buy", "", 0, "open_long", true},
 		{"sell", "sell_single", 1, "close_long", false},
 		{"buy", "open", 0, "open_long", false},
-		{"sell", "close", 0, "close_long", false},
+		{"buy", "close", 0, "close_long", false},
+		{"sell", "close", 0, "close_short", false},
 		{"sell", "reduce_close_long", 0, "close_long", false},
 	}
 	for _, tc := range tests {
@@ -98,7 +100,7 @@ func TestSyncOrdersFromBitgetBreakEvenClose(t *testing.T) {
 			id, id, side, tradeSide, qty, profit, base+offsetMs)
 	}
 	// Bitget returns newest first.
-	f.set(bitgetFillHistoryPath, `{"fillList":[`+
+	f.set(bitgetFillsPath, `{"fillList":[`+
 		fill("t3", "sell", "sell_single", "0.5", "0", 3000)+`,`+ // genuine new short (long already closed)
 		fill("t2", "sell", "sell_single", "0.2", "0", 2000)+`,`+ // break-even close of the long
 		fill("t1", "buy", "buy_single", "0.2", "0", 1000)+ // open long

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -32,6 +33,9 @@ type fakeBitget struct {
 	errCodes map[string][2]string
 	// failFirst makes the first N requests to a path fail (then succeed): path -> remaining count + error.
 	failFirst map[string]*bitgetFailFirst
+	// seq makes the nth request to a path return seq[path][n] (the last entry repeats).
+	seq     map[string][]string
+	seqHits map[string]int
 }
 
 type bitgetFailFirst struct {
@@ -48,6 +52,8 @@ func newFakeBitget(t *testing.T) *fakeBitget {
 		errCodes: map[string][2]string{},
 
 		failFirst: map[string]*bitgetFailFirst{},
+		seq:       map[string][]string{},
+		seqHits:   map[string]int{},
 	}
 	f.data[bitgetContractsPath] = bitgetTestContracts
 	f.data[bitgetTickerPath] = `[{"symbol":"BTCUSDT","lastPr":"50000"}]`
@@ -73,6 +79,14 @@ func newFakeBitget(t *testing.T) *fakeBitget {
 		f.mu.Lock()
 		f.reqs = append(f.reqs, rec)
 		data, ok := f.data[r.URL.Path]
+		if seq := f.seq[r.URL.Path]; len(seq) > 0 {
+			i := f.seqHits[r.URL.Path]
+			if i >= len(seq) {
+				i = len(seq) - 1
+			}
+			f.seqHits[r.URL.Path]++
+			data, ok = seq[i], true
+		}
 		ec, isErr := f.errCodes[r.URL.Path]
 		if ff := f.failFirst[r.URL.Path]; ff != nil && ff.remaining > 0 {
 			ff.remaining--
@@ -104,6 +118,43 @@ func (f *fakeBitget) fail(path, code, msg string) {
 	f.mu.Lock()
 	f.errCodes[path] = [2]string{code, msg}
 	f.mu.Unlock()
+}
+
+// setSeq makes successive requests to path return the given data payloads in order.
+func (f *fakeBitget) setSeq(path string, pages ...string) {
+	f.mu.Lock()
+	f.seq[path] = pages
+	f.mu.Unlock()
+}
+
+// setFixture serves a captured real Bitget Demo response (trader/testdata/bitget/<name>.json)
+// for path: its data payload when code is 00000, otherwise the exchange error.
+func (f *fakeBitget) setFixture(path, name string) {
+	f.t.Helper()
+	code, msg, data := bitgetFixture(f.t, name)
+	if code != "00000" {
+		f.fail(path, code, msg)
+		return
+	}
+	f.set(path, string(data))
+}
+
+// bitgetFixture loads a real response captured from the Bitget Demo environment (verbatim,
+// only order ids / prices inside) and returns its envelope parts.
+func bitgetFixture(t *testing.T, name string) (code, msg string, data json.RawMessage) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("testdata", "bitget", name+".json"))
+	if err != nil {
+		t.Fatalf("fixture %s: %v", name, err)
+	}
+	var resp BitgetResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("fixture %s: %v", name, err)
+	}
+	if len(resp.Data) == 0 {
+		resp.Data = json.RawMessage("null")
+	}
+	return resp.Code, resp.Msg, resp.Data
 }
 
 // failFirstN makes the first n requests to path fail with the given code, then succeed again.
@@ -333,118 +384,96 @@ func TestBitgetSetStopLossTakeProfit(t *testing.T) {
 	}
 }
 
-func TestBitgetSetStopLossReplacesExistingSameType(t *testing.T) {
+// mutatingBitgetRequests returns every recorded request that is not a read (GET).
+func mutatingBitgetRequests(f *fakeBitget) []bitgetRecReq {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []bitgetRecReq
+	for _, r := range f.reqs {
+		if r.Method != "GET" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// place-tpsl-order is an upsert for pos_loss / pos_profit (verified on Bitget Demo: a second
+// call returned the SAME orderId and the listing showed one order with the new trigger), so
+// replacing a SL must be exactly one place request: no cancel (it would open an unprotected
+// window) and no plan-order listing.
+func TestBitgetSetStopLossUpsertsWithoutCancel(t *testing.T) {
 	tr, f := newTestBitget(t, false)
-	f.set(bitgetPlanPendingPath, `{"entrustedList":[
-		{"orderId":"1","planType":"pos_loss","triggerPrice":"48000","side":"sell","posSide":"net","symbol":"BTCUSDT"},
-		{"orderId":"2","planType":"pos_profit","triggerPrice":"52000","side":"sell","posSide":"net","symbol":"BTCUSDT"}]}`)
+	// a live long position already has SL 48000 and TP 52000
+	f.setFixture(bitgetPlanPendingPath, "plan_pending")
+	f.setFixture(bitgetPlaceTPSLPath, "tpsl_sl")
+
 	if err := tr.SetStopLoss("BTCUSDT", "LONG", 0, 49000); err != nil {
 		t.Fatal(err)
 	}
-	q := f.last(bitgetPlanPendingPath).Query
-	if q["planType"] != "profit_loss" || q["symbol"] != "BTCUSDT" || q["productType"] != "USDT-FUTURES" {
-		t.Errorf("plan pending query = %v", q)
+	if n := len(f.find(bitgetCancelPlanPath)); n != 0 {
+		t.Errorf("cancel-plan-order requests = %d, want 0 (placement is an upsert)", n)
 	}
-	cancel := f.last(bitgetCancelPlanPath).Body
-	list, _ := cancel["orderIdList"].([]interface{})
-	if len(list) != 1 || list[0].(map[string]interface{})["orderId"] != "1" {
-		t.Errorf("must cancel only the existing SL: %v", cancel)
+	if n := len(f.find(bitgetPlanPendingPath)); n != 0 {
+		t.Errorf("plan listing requests = %d, want 0 (nothing to look up before an upsert)", n)
 	}
-	if cancel["planType"] != "profit_loss" || cancel["marginCoin"] != "USDT" || cancel["symbol"] != "BTCUSDT" {
-		t.Errorf("cancel body = %v", cancel)
+	muts := mutatingBitgetRequests(f)
+	if len(muts) != 1 || muts[0].Path != bitgetPlaceTPSLPath {
+		t.Fatalf("only one place-tpsl-order request expected, got %+v", muts)
 	}
-	// cancel precedes place
-	f.mu.Lock()
-	order := []string{}
-	for _, r := range f.reqs {
-		if r.Path == bitgetCancelPlanPath || r.Path == bitgetPlaceTPSLPath {
-			order = append(order, r.Path)
-		}
-	}
-	f.mu.Unlock()
-	if len(order) != 2 || order[0] != bitgetCancelPlanPath {
-		t.Errorf("call order = %v", order)
+	b := muts[0].Body
+	if b["planType"] != "pos_loss" || b["holdSide"] != "buy" || b["triggerPrice"] != "49000.0" || b["symbol"] != "BTCUSDT" {
+		t.Errorf("body = %v", b)
 	}
 }
 
-// If the replacement TP/SL is rejected after the old one was cancelled, the old trigger must be
-// re-placed so the live position stays protected.
-func TestBitgetPlaceTPSLRestoresPreviousOnFailure(t *testing.T) {
-	existing := `{"entrustedList":[{"orderId":"1","planType":"pos_loss","triggerPrice":"95","side":"sell","posSide":"net","symbol":"BTCUSDT"}]}`
-
-	t.Run("restore succeeds", func(t *testing.T) {
+func TestBitgetPlaceTPSLUpsertSemantics(t *testing.T) {
+	t.Run("rejected placement propagates the exchange error and touches nothing else", func(t *testing.T) {
 		tr, f := newTestBitget(t, false)
-		f.set(bitgetPlanPendingPath, existing)
-		f.failFirstN(bitgetPlaceTPSLPath, 1, "40917", "trigger price invalid")
+		// real error returned by Bitget for a SHORT whose SL is below the mark price
+		f.fail(bitgetPlaceTPSLPath, "45122", "Short position stop loss price please > mark price")
+		f.setFixture(bitgetPlanPendingPath, "plan_pending_short") // the short's old SL stays live
 
-		err := tr.SetStopLoss("BTCUSDT", "LONG", 0, 94)
+		err := tr.SetStopLoss("BTCUSDT", "SHORT", 0, 90000)
 		if err == nil {
-			t.Fatal("expected error when the new SL is rejected")
+			t.Fatal("expected the rejection to be returned")
 		}
-		if !strings.Contains(err.Error(), "40917") || !strings.Contains(err.Error(), "restored @ 95") {
-			t.Errorf("error should carry the cause and the restore result: %v", err)
+		for _, want := range []string{"45122", "stop loss price please > mark price", "wrong side"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q should contain %q", err, want)
+			}
 		}
-		if strings.Contains(err.Error(), "NOT restored") {
-			t.Errorf("restore succeeded, error must not say otherwise: %v", err)
+		if strings.Contains(err.Error(), "restored") {
+			t.Errorf("there is no restore step any more: %v", err)
 		}
-		places := f.find(bitgetPlaceTPSLPath)
-		if len(places) != 2 {
-			t.Fatalf("want attempted place + restore = 2 place requests, got %d", len(places))
+		muts := mutatingBitgetRequests(f)
+		if len(muts) != 1 || muts[0].Path != bitgetPlaceTPSLPath {
+			t.Errorf("the failed upsert must be the only mutating request (old order untouched), got %+v", muts)
 		}
-		if places[0].Body["triggerPrice"] != "94.0" {
-			t.Errorf("first place should be the new trigger, got %v", places[0].Body["triggerPrice"])
-		}
-		restore := places[1].Body
-		if restore["triggerPrice"] != "95" || restore["planType"] != "pos_loss" || restore["holdSide"] != "buy" ||
-			restore["symbol"] != "BTCUSDT" || restore["triggerType"] != "mark_price" {
-			t.Errorf("restore body = %v", restore)
-		}
-		if n := len(f.find(bitgetCancelPlanPath)); n != 1 {
-			t.Errorf("cancel requests = %d, want 1", n)
+		if len(f.find(bitgetCancelPlanPath)) != 0 {
+			t.Errorf("must not cancel anything")
 		}
 	})
 
-	t.Run("restore fails too", func(t *testing.T) {
+	t.Run("take profit upsert is symmetrical", func(t *testing.T) {
 		tr, f := newTestBitget(t, false)
-		f.set(bitgetPlanPendingPath, existing)
-		f.fail(bitgetPlaceTPSLPath, "40917", "trigger price invalid")
-
-		err := tr.SetStopLoss("BTCUSDT", "LONG", 0, 94)
-		if err == nil || !strings.Contains(err.Error(), "NOT restored") || !strings.Contains(err.Error(), "unprotected") {
-			t.Fatalf("error must say the restore failed: %v", err)
+		f.setFixture(bitgetPlaceTPSLPath, "tpsl_tp")
+		if err := tr.SetTakeProfit("BTCUSDT", "LONG", 0, 92000); err != nil {
+			t.Fatal(err)
 		}
-		if n := len(f.find(bitgetPlaceTPSLPath)); n != 2 {
-			t.Errorf("place requests = %d, want 2 (attempt + restore)", n)
+		muts := mutatingBitgetRequests(f)
+		if len(muts) != 1 || muts[0].Body["planType"] != "pos_profit" || muts[0].Body["holdSide"] != "buy" {
+			t.Errorf("requests = %+v", muts)
 		}
 	})
 
-	t.Run("no previous order means no restore", func(t *testing.T) {
+	t.Run("contract lookup failure sends nothing", func(t *testing.T) {
 		tr, f := newTestBitget(t, false)
-		f.fail(bitgetPlaceTPSLPath, "40917", "trigger price invalid")
-
-		err := tr.SetStopLoss("BTCUSDT", "LONG", 0, 94)
-		if err == nil || strings.Contains(err.Error(), "restored") {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if n := len(f.find(bitgetPlaceTPSLPath)); n != 1 {
-			t.Errorf("place requests = %d, want 1", n)
-		}
-	})
-
-	t.Run("take profit restores only its own side and kind", func(t *testing.T) {
-		tr, f := newTestBitget(t, false)
-		f.set(bitgetPlanPendingPath, `{"entrustedList":[
-			{"orderId":"1","planType":"pos_loss","triggerPrice":"95","holdSide":"buy","symbol":"BTCUSDT"},
-			{"orderId":"2","planType":"pos_profit","triggerPrice":"120","holdSide":"buy","symbol":"BTCUSDT"},
-			{"orderId":"3","planType":"pos_profit","triggerPrice":"80","holdSide":"sell","symbol":"BTCUSDT"}]}`)
-		f.failFirstN(bitgetPlaceTPSLPath, 1, "40917", "boom")
-
-		if err := tr.SetTakeProfit("BTCUSDT", "LONG", 0, 130); err == nil {
+		f.set(bitgetContractsPath, `[]`)
+		if err := tr.SetStopLoss("NOPEUSDT", "LONG", 0, 1); err == nil {
 			t.Fatal("expected error")
 		}
-		places := f.find(bitgetPlaceTPSLPath)
-		if len(places) != 2 || places[1].Body["triggerPrice"] != "120" || places[1].Body["planType"] != "pos_profit" {
-			t.Errorf("restore should re-place only the long TP @120: %+v", places)
+		if len(f.find(bitgetPlaceTPSLPath)) != 0 {
+			t.Errorf("nothing may be placed without a valid trigger price")
 		}
 	})
 }
@@ -569,13 +598,31 @@ func TestBitgetSignature(t *testing.T) {
 }
 
 func TestBitgetAPIErrorHints(t *testing.T) {
+	t.Run("40099 environment mismatch", func(t *testing.T) {
+		tr, f := newTestBitget(t, true)
+		f.fail(bitgetAccountPath, "40099", "exchange environment is incorrect")
+		_, err := tr.GetBalance()
+		want := "API key environment mismatch: demo key requires Demo mode (testnet toggle) and live keys must not enable it"
+		if err == nil || !strings.Contains(err.Error(), "40099") || !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want hint %q", err, want)
+		}
+	})
+	t.Run("40404 endpoint not found", func(t *testing.T) {
+		tr, f := newTestBitget(t, false)
+		f.setFixture(bitgetFillsPath, "fill_history") // the real 40404 response of the non-existent endpoint
+		_, err := tr.GetTrades(time.Now().Add(-time.Hour), 100)
+		if err == nil || !strings.Contains(err.Error(), "40404") || !strings.Contains(err.Error(), "endpoint not found") {
+			t.Errorf("err = %v", err)
+		}
+	})
+
 	tr, f := newTestBitget(t, false)
 	f.fail(bitgetOrderPath, "40774", "The order type for unilateral position must also be the unilateral position type.")
 	_, err := tr.OpenLong("BTCUSDT", 0.002, 3)
 	if err == nil || !strings.Contains(err.Error(), "40774") || !strings.Contains(err.Error(), "one-way") {
 		t.Errorf("err = %v", err)
 	}
-	for _, c := range []string{"40774", "45110", "40762", "43012", "40808", "40917", "45122", "22002"} {
+	for _, c := range []string{"40774", "45110", "40762", "43012", "40808", "40917", "45122", "22002", "40099", "40404"} {
 		if bitgetErrorHint(c) == "" {
 			t.Errorf("no hint for %s", c)
 		}
@@ -789,8 +836,10 @@ func TestClassifyBitgetFill(t *testing.T) {
 	}{
 		{"hedge open long", "buy", "open", 0, "open_long"},
 		{"hedge open short", "sell", "open", 0, "open_short"},
-		{"hedge close long", "sell", "close", 5, "close_long"},
-		{"hedge close short", "buy", "close", -5, "close_short"},
+		// hedge mode: side is the POSITION direction (real fill: buy+close, profit 2.29028 closed a long)
+		{"hedge close long", "buy", "close", 5, "close_long"},
+		{"hedge close short", "sell", "close", -5, "close_short"},
+		{"hedge close break-even long", "buy", "close", 0, "close_long"},
 		{"one-way buy open", "buy", "buy_single", 0, "open_long"},
 		{"one-way sell open", "sell", "sell_single", 0, "open_short"},
 		{"one-way sell close", "sell", "sell_single", 12.5, "close_long"},
@@ -819,7 +868,7 @@ func TestBitgetGetTradesFeeAndPagination(t *testing.T) {
 
 	var mu sync.Mutex
 	pages := 0
-	// Override the fill-history path with a paging handler by wrapping data per call.
+	// Override the fills path with a paging handler by wrapping data per call.
 	pageData := []string{
 		`{"fillList":[
 			{"tradeId":"t3","orderId":"o3","symbol":"NVDAUSDT","side":"sell","price":"130","baseVolume":"1","profit":"4.5","tradeSide":"sell_single","cTime":"1700000003000","feeDetail":[{"feeCoin":"USDT","totalFee":"-0.0780"}]},
@@ -830,7 +879,7 @@ func TestBitgetGetTradesFeeAndPagination(t *testing.T) {
 		  "endId":""}`,
 	}
 	f.mu.Lock()
-	delete(f.data, bitgetFillHistoryPath)
+	delete(f.data, bitgetFillsPath)
 	f.mu.Unlock()
 	// replace server with paging behaviour
 	paging := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -907,85 +956,4 @@ func TestBitgetGetTradesPaginationParams(t *testing.T) {
 	if queries[0]["limit"] != "100" || queries[0]["idLessThan"] != "" || queries[1]["idLessThan"] != "cb" {
 		t.Errorf("queries = %v", queries[:2])
 	}
-}
-
-// ---------- demo integration (needs real demo credentials) ----------
-
-func TestBitgetDemoIntegration(t *testing.T) {
-	key := os.Getenv("BITGET_DEMO_API_KEY")
-	secret := os.Getenv("BITGET_DEMO_SECRET_KEY")
-	pass := os.Getenv("BITGET_DEMO_PASSPHRASE")
-	if key == "" || secret == "" || pass == "" {
-		t.Skip("BITGET_DEMO_API_KEY / BITGET_DEMO_SECRET_KEY / BITGET_DEMO_PASSPHRASE not set")
-	}
-
-	tr := NewBitgetTraderWithOptions(key, secret, pass, true)
-	const symbol = "BTCUSDT"
-
-	bal, err := tr.GetBalance()
-	if err != nil {
-		t.Fatalf("GetBalance: %v", err)
-	}
-	t.Logf("balance: %v", bal)
-
-	contract, err := tr.GetContractInfo(symbol)
-	if err != nil {
-		t.Fatalf("GetContractInfo: %v", err)
-	}
-	price, err := tr.GetMarketPrice(symbol)
-	if err != nil {
-		t.Fatalf("GetMarketPrice: %v", err)
-	}
-	// smallest order that satisfies both min size and min notional
-	qty := math.Max(contract.MinTradeNum, math.Ceil(contract.MinTradeUSDT*1.2/price/contract.SizeMultiplier)*contract.SizeMultiplier)
-
-	if err := tr.SetMarginMode(symbol, true); err != nil {
-		t.Logf("SetMarginMode: %v", err)
-	}
-	res, err := tr.OpenLong(symbol, qty, 3)
-	if err != nil {
-		t.Fatalf("OpenLong: %v", err)
-	}
-	t.Logf("open: %v", res)
-	// always try to clean up
-	defer func() {
-		_ = tr.CancelAllOrders(symbol)
-		if _, err := tr.CloseLong(symbol, 0); err != nil {
-			t.Logf("cleanup CloseLong: %v", err)
-		}
-	}()
-
-	if err := tr.SetStopLoss(symbol, "LONG", qty, price*0.9); err != nil {
-		t.Fatalf("SetStopLoss: %v", err)
-	}
-	if err := tr.SetTakeProfit(symbol, "LONG", qty, price*1.1); err != nil {
-		t.Fatalf("SetTakeProfit: %v", err)
-	}
-	orders, err := tr.GetOpenOrders(symbol)
-	if err != nil {
-		t.Fatalf("GetOpenOrders: %v", err)
-	}
-	var sl, tp bool
-	for _, o := range orders {
-		t.Logf("open order: %+v", o)
-		sl = sl || o.Type == "STOP_MARKET"
-		tp = tp || o.Type == "TAKE_PROFIT_MARKET"
-	}
-	if !sl || !tp {
-		t.Errorf("expected SL and TP in open orders (sl=%v tp=%v)", sl, tp)
-	}
-
-	if _, err := tr.CloseLong(symbol, 0); err != nil {
-		t.Fatalf("CloseLong: %v", err)
-	}
-	if err := tr.CancelStopOrders(symbol); err != nil {
-		t.Errorf("CancelStopOrders: %v", err)
-	}
-
-	time.Sleep(2 * time.Second)
-	recs, err := tr.GetClosedPnL(time.Now().Add(-10*time.Minute), 20)
-	if err != nil {
-		t.Fatalf("GetClosedPnL: %v", err)
-	}
-	t.Logf("closed pnl records: %+v", recs)
 }
